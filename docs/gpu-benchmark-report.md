@@ -19,6 +19,12 @@ doc-bench.
 | Scoring / metrics (all 3 datasets, CPU) | **~2.1 s** (0.68–0.74 s each) |
 | **Total** | **~6 m 35 s** |
 
+For comparison, running the same benchmark **CPU-only takes ~15 minutes on
+average** (≈2–2.5× the GPU subprocess run) — the equation-heavy OmniDocBench page
+alone accounts for ~8 minutes of that on CPU (see `docs/benchmark-results.md`).
+The GPU brings this down to ~6.5 min, and the in-process optimisation in §8
+further to **~1 min**.
+
 The benchmark cost is almost entirely MinerU document parsing. The doc-bench
 scoring step (NED/TEDS computation) is effectively free at this corpus size.
 
@@ -81,6 +87,14 @@ done
 | dp_bench | 5 | ~160 s (2 m 40 s) | ~32 s |
 | omnidocbench | 5 | ~187 s (3 m 07 s) | ~37 s |
 | **Total** | **11** | **393 s (6 m 33 s)** | ~36 s |
+
+**Whole-benchmark runtime by configuration (all 11 docs):**
+
+| Configuration | Total time | Notes |
+|---------------|-----------|-------|
+| CPU-only (per-doc subprocess) | **~15 min** (avg) | equation page ~8 min alone; slow model init (~46 s) + OCR (~5 it/s) |
+| GPU (per-doc subprocess) | **6 m 33 s** | this run; ~30 s/doc fixed startup |
+| GPU (in-process, model reuse — §8) | **1 m 00 s** | models load once; ~3–6 s/doc after the first |
 
 ### 4.2 Per-document latency
 
@@ -307,7 +321,44 @@ took ~8 min on CPU; the entire 11-doc run is 6.5 min on GPU).
 
 | Lever | Effect |
 |-------|--------|
-| Reuse one MinerU process instead of per-doc subprocess restart | Removes ~30 s/doc fixed overhead → biggest speedup |
+| ~~Reuse one MinerU process instead of per-doc subprocess restart~~ | **Done (§8)** — 6 m 33 s → 1 m 00 s (6.5×) |
 | Enable VLM enrichment (image/table/equation) | Improves chart/figure NED and table TEDS; adds VLM latency |
 | Larger corpus | Inference scales with content; the fixed ~30 s/doc startup dominates only on tiny corpora like this one |
 | Faster/larger GPU | Marginal here — inference is already a small fraction of per-doc time |
+
+---
+
+## 8. Optimization applied: in-process MinerU (model reuse)
+
+The §4.3 finding — that ~30 s of every document's latency was fixed
+subprocess/model-load overhead — was acted on. `_run_mineru` now drives MinerU
+**in-process** via `mineru.cli.common.do_parse` instead of spawning one `mineru`
+CLI subprocess per document. MinerU's pipeline `ModelSingleton` keeps the
+detection/OCR/table/formula models resident, so they load **once per process**
+and every subsequent document reuses them. The CLI subprocess remains as a
+fallback if the in-process call fails.
+
+**Result (same 11 documents, same RTX 3060, same accuracy):**
+
+| | Per-doc subprocess (before) | In-process, model reuse (after) |
+|---|---|---|
+| Model initialisations | 11 (one per doc) | **1** (once per process) |
+| Total prediction time | 6 m 33 s | **1 m 00 s** |
+| Speedup | — | **~6.5×** |
+| Per-doc latency (doc 2+) | ~31–46 s | **~3–6 s** |
+
+Per-document after the change: the first document pays the one-time model load
+(~8 s init + first-call warmup, ~17 s total); every document after it parses in
+**~3–6 s** because only inference runs. Output is unchanged — element counts are
+identical and NED/TEDS match to within normal MinerU run-to-run variance
+(dp_bench NED identical at 0.7921; ato/omni differ by ≤0.01). The parser's unit
+suite (`tests/hybrid_doc_parser/test_parser.py`) still passes (23/23).
+
+**Implementation notes / caveats:**
+- The MinerU PDF-render workers use the multiprocessing **`spawn`** start method,
+  which re-imports the entry module. The entry script must therefore guard its
+  code under `if __name__ == "__main__":` (as `scripts/generate_predictions.py`
+  does) — otherwise spawned workers re-execute module-level code and raise
+  `RuntimeError: ... freeze_support()`, forcing a fall back to the slow CLI path.
+- Device selection (CPU/GPU) is unchanged: MinerU's `get_device()` honours
+  `CUDA_VISIBLE_DEVICES` / `MINERU_DEVICE_MODE`.

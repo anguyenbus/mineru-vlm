@@ -182,6 +182,56 @@ def _read_output_files(output_dir: Path) -> list[dict]:
     return []
 
 
+def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[dict]:
+    """Run MinerU in-process via ``mineru.cli.common.do_parse`` and return content_list.
+
+    This is the fast path: unlike the CLI subprocess fallback, it keeps the
+    heavy detection/OCR/table/formula models resident in this process across
+    calls (MinerU's pipeline ``ModelSingleton`` caches them), so model
+    initialisation is paid once per process rather than once per document.
+
+    The device (CPU/GPU) is chosen by MinerU's own ``get_device()``, which
+    honours ``MINERU_DEVICE_MODE`` and ``CUDA_VISIBLE_DEVICES`` — set
+    ``CUDA_VISIBLE_DEVICES=""`` to force CPU.
+
+    Args:
+        file_path: Path to the PDF or image to parse.
+        backend: MinerU backend identifier (e.g. ``pipeline``).
+
+    Returns:
+        The MinerU content_list (list of block dicts), or an empty list when
+        no content was produced.
+
+    Raises:
+        ImportError: When the MinerU Python API is not importable.
+        Exception: Propagated from MinerU; the caller falls back to the CLI.
+    """
+    from mineru.cli.common import do_parse, read_fn  # noqa: PLC0415
+
+    # read_fn returns PDF bytes for PDFs and rasterised PDF bytes for images.
+    pdf_bytes = read_fn(file_path)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        # Only the content_list dump is needed; disable the other artefacts to
+        # save I/O. parse_method="auto" mirrors the CLI's `-m auto`.
+        do_parse(
+            output_dir=str(out_dir),
+            pdf_file_names=[file_path.stem],
+            pdf_bytes_list=[pdf_bytes],
+            p_lang_list=["en"],
+            backend=backend,
+            parse_method="auto",
+            f_draw_layout_bbox=False,
+            f_draw_span_bbox=False,
+            f_dump_md=False,
+            f_dump_middle_json=False,
+            f_dump_model_output=False,
+            f_dump_orig_pdf=False,
+            f_dump_content_list=True,
+        )
+        return _read_output_files(out_dir)
+
+
 def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
     """Invoke MinerU and return its content_list output.
 
@@ -205,28 +255,23 @@ def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
     Raises:
         RuntimeError: When both the Python API and CLI fallback fail.
     """
-    # Try MinerU Python API first — never import at module level to avoid
-    # hard dependency on mineru at import time.
+    # Preferred path: drive MinerU IN-PROCESS via its public CLI helper
+    # (mineru.cli.common.do_parse). This avoids spawning a fresh `mineru`
+    # subprocess per document — which costs ~20-30s of service spin-up plus a
+    # full model re-load every time. do_parse uses pipeline ModelSingleton, so
+    # the heavy models load on the first document and are reused for every
+    # subsequent document in this process.
+    #
+    # NOTE: imported lazily so `mineru` is not a hard import-time dependency.
     try:
-        from mineru.backend.pipeline import (  # type: ignore[import]  # noqa: PLC0415
-            pipeline_doc_analyze,
-            pipeline_result_to_middle_json,
-        )
-
-        result = pipeline_doc_analyze(str(file_path), backend=backend)
-        middle_json = pipeline_result_to_middle_json(result)
-        if isinstance(middle_json, dict):
-            pdf_info = middle_json.get("pdf_info", [])
-            content_list: list[dict] = []
-            for page_info in pdf_info:
-                content_list.extend(page_info.get("para_blocks", []))
-            return content_list
-        if isinstance(middle_json, list):
-            return middle_json
+        content = _run_mineru_inprocess(file_path, backend=backend)
+        if content:
+            return content
+        logger.debug("[parser] in-process MinerU returned no content; trying CLI fallback")
     except ImportError:
         logger.debug("[parser] MinerU Python API not importable; trying CLI fallback")
-    except Exception as exc:
-        logger.debug("[parser] MinerU Python API failed: {}; trying CLI fallback", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[parser] in-process MinerU failed: {}; trying CLI fallback", exc)
 
     # WARN: CLI fallback — slower, spawns a subprocess, requires mineru on PATH.
     try:
