@@ -98,19 +98,35 @@ done
 
 ### 4.2 Per-document latency
 
-| Document | Dataset | Latency | Elements |
-|----------|---------|---------|----------|
-| 1371-6.1997 (2 pages) | ato_bench | 46.2 s | 94 |
-| 01030000000001 | dp_bench | 31.1 s | 8 |
-| 01030000000002 | dp_bench | 33.0 s | 8 |
-| 01030000000017 | dp_bench | 31.9 s | 6 |
-| 01030000000027 (chart) | dp_bench | 31.8 s | 5 |
-| 01030000000040 | dp_bench | 32.0 s | 9 |
-| PPT_english…_002 | omnidocbench | 32.1 s | 5 |
-| jiaocaineedrop_Chapter9_46 | omnidocbench | 37.0 s | 21 |
-| jiaocaineedrop_c04_6 | omnidocbench | 31.9 s | 31 |
-| page-573c437e (book) | omnidocbench | 41.0 s | 7 |
-| page-c1c135ad (equation-heavy, 40 formulas) | omnidocbench | 45.4 s | 14 |
+Two GPU configurations are shown: **subprocess** (a fresh `mineru` process per
+document, this report's original run) and **in-process** (§8 — models loaded once
+and reused across all documents). The in-process column is where the savings
+land: only the *first* document pays the one-time model load; every document
+after it is pure inference.
+
+| Document | Dataset | Subprocess (per-doc) | In-process (model reuse) | Elements |
+|----------|---------|----------------------|--------------------------|----------|
+| 1371-6.1997 (2 pages) | ato_bench | 46.2 s | 24.1 s ⟵ pays one-time model load | 94 |
+| 01030000000001 | dp_bench | 31.1 s | **0.9 s** | 8 |
+| 01030000000002 | dp_bench | 33.0 s | **2.7 s** | 8 |
+| 01030000000017 | dp_bench | 31.9 s | **0.8 s** | 6 |
+| 01030000000027 (chart) | dp_bench | 31.8 s | **0.8 s** | 5 |
+| 01030000000040 | dp_bench | 32.0 s | **1.0 s** | 9 |
+| PPT_english…_002 | omnidocbench | 32.1 s | **1.1 s** | 5 |
+| jiaocaineedrop_Chapter9_46 | omnidocbench | 37.0 s | **3.8 s** | 21 |
+| jiaocaineedrop_c04_6 | omnidocbench | 31.9 s | **1.8 s** | 31 |
+| page-573c437e (book) | omnidocbench | 41.0 s | **8.4 s** | 7 |
+| page-c1c135ad (equation-heavy, 40 formulas) | omnidocbench | 45.4 s | **13.1 s** | 14 |
+| **Total (all docs, one run)** | | **393 s (6 m 33 s)** | **58.6 s** | |
+
+**Running all documents together is where the time is saved.** Because the heavy
+models load only once per process, the per-document cost collapses from a flat
+~31–46 s (each subprocess re-loading models) to ~1–4 s for typical pages once the
+models are warm — the first document absorbs the ~24 s load, and the remaining
+ten finish in **~34 s combined**. The more documents you batch into a single run,
+the more the one-time load is amortised: at 11 docs the whole set drops from
+6 m 33 s to **58.6 s (~6.7×)**; on a larger corpus the per-doc figures
+(~1–4 s text, ~8–13 s table/equation pages) are what dominate.
 
 ### 4.3 Where the latency goes (this is the important part)
 
