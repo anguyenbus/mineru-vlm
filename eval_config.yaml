@@ -1,0 +1,17 @@
+# Evaluation configuration for doc-bench
+# See: doc_bench/runners/run_parsing_eval.py
+
+datasets:
+  ato_bench: {}  # falls back to bundled fixtures inside the package
+
+  dp_bench:
+    path: benchmark/dp_bench  # synthesized by scripts/generate_predictions.py
+
+  omnidocbench:
+    path: benchmark/omnidocbench  # synthesized by scripts/generate_predictions.py
+
+metrics:
+  ned: {}
+  teds: {}
+
+models: {}

@@ -1,0 +1,67 @@
+[project]
+name = "hybrid-doc-parser"
+version = "0.1.0"
+description = "MinerU 3.xx + per-element VLM enrichment hybrid document parser"
+requires-python = ">=3.12"
+dependencies = [
+    "pypdfium2>=4.30",
+    "Pillow>=10.0",
+    "pydantic>=2.7",
+    "beartype>=0.18",
+    "icontract>=2.6",
+    "loguru>=0.7",
+    "openai>=1.30",
+    "boto3>=1.34",
+    "mineru[pipeline]>=3.2.3",
+    "doc-bench",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "black>=24.0",
+    "pre-commit>=3.7",
+    "fpdf2>=2.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hybrid_doc_parser"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "D"]
+ignore = ["E501", "D203", "D212"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+markers = [
+    "live: requires real VLM credentials (skipped in CI unless LIVE_TESTS=1)",
+    "slow: invokes MinerU end-to-end; exclude from fast test runs",
+    "asyncio: marks tests as async",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+
+[tool.uv.sources]
+doc-bench = { path = "doc_bench-0.1.0-py3-none-any.whl" }
