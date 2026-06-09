@@ -72,6 +72,17 @@ class EnrichmentConfig(BaseModel):
         max_context_tokens: Approximate token cap for context text (64–4096).
         vlm_backend: Which VLM backend to use; ``"openai_compatible"`` for
             any OpenAI-protocol server, ``"bedrock"`` for AWS Bedrock.
+        parser: Which document parsing backend to use; ``"mineru"`` for the
+            MinerU pipeline (default), ``"docling"`` for Docling (supports
+            DOCX, HTML, and other non-PDF formats).
+        do_ocr: Enable OCR during Docling PDF processing; default ``True``.
+        table_mode: Docling TableFormer mode; ``"fast"`` (default) or
+            ``"accurate"`` for higher fidelity at the cost of latency.
+        do_table_structure: Enable Docling table structure recognition
+            (TableFormer); default ``True``. Set to ``False`` for
+            latency-sensitive workloads.
+        docling_artifacts_path: Optional local path where Docling model
+            artefacts are stored; ``None`` uses the Docling default cache.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -83,6 +94,13 @@ class EnrichmentConfig(BaseModel):
     context_window: int = Field(default=3, ge=0, le=20)
     max_context_tokens: int = Field(default=512, ge=64, le=4096)
     vlm_backend: Literal["openai_compatible", "bedrock"] = "openai_compatible"
+    parser: Literal["mineru", "docling"] = "mineru"
+
+    # NOTE: Docling-specific pipeline controls; ignored when parser="mineru"
+    do_ocr: bool = True
+    table_mode: Literal["fast", "accurate"] = "fast"
+    do_table_structure: bool = True
+    docling_artifacts_path: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +166,10 @@ class WarningRecord(BaseModel):
             for document-level warnings (e.g. unsupported file type).
         code: Short machine-readable code identifying the warning category.
             Known codes: ``"unsupported_type"``, ``"unhandled_exception"``,
-            ``"mineru_failed"``, ``"vlm_failed"``, ``"quality_gate_error"``,
-            ``"cache_write_error"``, ``"render_failed"``.
+            ``"mineru_failed"``, ``"docling_failed"``, ``"vlm_failed"``,
+            ``"quality_gate_error"``, ``"cache_write_error"``,
+            ``"render_failed"``, ``"enrichment_not_supported"``,
+            ``"image_too_large"``, ``"docling_error"``, ``"mineru_error"``.
         message: Human-readable description of the problem.
     """
 

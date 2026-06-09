@@ -1,0 +1,49 @@
+{
+  "body": {
+    "children": [
+      "#/texts/0",
+      "#/texts/1",
+      "#/texts/2",
+      "#/texts/3",
+      "#/pictures/0",
+      "#/tables/0"
+    ]
+  },
+  "texts": [
+    {
+      "label": "paragraph",
+      "orig": "A paragraph of body text.",
+      "prov": [{"page_no": 1, "bbox": null}]
+    },
+    {
+      "label": "section_header",
+      "orig": "Section One",
+      "prov": [{"page_no": 1}]
+    },
+    {
+      "label": "formula",
+      "orig": "E = mc^2",
+      "prov": [{"page_no": 1}]
+    },
+    {
+      "label": "list_item",
+      "orig": "First bullet point.",
+      "prov": [{"page_no": 1}]
+    }
+  ],
+  "pictures": [
+    {
+      "image": {
+        "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI6QAAAABJRU5ErkJggg=="
+      },
+      "prov": [{"page_no": 1}]
+    }
+  ],
+  "tables": [
+    {
+      "caption": "Table 1",
+      "data": [["Col A", "Col B"], ["1", "2"]],
+      "prov": [{"page_no": 1}]
+    }
+  ]
+}
