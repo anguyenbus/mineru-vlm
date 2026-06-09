@@ -242,7 +242,7 @@ class BedrockClient:
         try:
             import boto3  # noqa: PLC0415
 
-            region = os.environ.get("AWS_REGION", "us-east-1")
+            region = os.environ.get("AWS_REGION", "ap-southeast-2")
             model_id = os.environ.get("BEDROCK_VLM_MODEL", "")
             body = _build_bedrock_request(image_bytes, prompt)
             runtime = boto3.client("bedrock-runtime", region_name=region)

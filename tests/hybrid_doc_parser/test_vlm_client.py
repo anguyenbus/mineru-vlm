@@ -141,7 +141,7 @@ def test_openai_client_call_with_image(monkeypatch):
 
 
 def test_bedrock_client_never_raises(monkeypatch):
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
     monkeypatch.setenv("BEDROCK_VLM_MODEL", "test-model")
 
     from hybrid_doc_parser.vlm_client import BedrockClient
@@ -155,7 +155,7 @@ def test_bedrock_client_never_raises(monkeypatch):
 
 
 def test_bedrock_request_structure(monkeypatch):
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
     monkeypatch.setenv("BEDROCK_VLM_MODEL", "anthropic.claude-3-sonnet")
 
     from hybrid_doc_parser.vlm_client import BedrockClient
