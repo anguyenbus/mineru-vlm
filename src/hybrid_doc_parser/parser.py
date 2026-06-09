@@ -93,6 +93,34 @@ _PDFIUM_LOCK: threading.Lock = threading.Lock()
 _DOCLING_CONVERTER_CACHE: dict[tuple, Any] = {}
 _DOCLING_CONVERTER_CACHE_LOCK: threading.Lock = threading.Lock()
 
+# Default chunk size for MinerU batch inference when MINERU_BATCH_SIZE is unset
+# or non-parseable. Must remain finite/bounded (never 0, negative, or unbounded).
+_DEFAULT_MINERU_BATCH_SIZE: Final[int] = 8
+
+# Default number of concurrent in-process MinerU do_parse windows allowed across
+# all callers. 1 == serialise GPU inference (single shared device). Tunable via
+# MINERU_MAX_INFLIGHT for multi-GPU hosts.
+_DEFAULT_MINERU_MAX_INFLIGHT: Final[int] = 1
+
+# Process-wide gate serialising do_parse inference across concurrent parse_batch
+# calls. Built lazily (so MINERU_MAX_INFLIGHT is read at first use, not import).
+_MINERU_INFERENCE_SEMA: threading.BoundedSemaphore | None = None
+_MINERU_INFERENCE_SEMA_LOCK: threading.Lock = threading.Lock()
+
+# Warning codes that mark a per-document parse as failed (vs a clean parse or a
+# soft signal like quality_gate_escalation). Used to count batch failures for
+# the parse_batch() summary line.
+_BATCH_FAILURE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "mineru_failed",
+        "mineru_error",
+        "docling_failed",
+        "docling_error",
+        "file_not_found",
+        "unsupported_type",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -204,6 +232,49 @@ def _read_output_files(output_dir: Path) -> list[dict]:
     return []
 
 
+def _read_content_list_for_stem(output_dir: Path, name: str) -> list[dict]:
+    """Read one file's MinerU content_list by its unique synthetic name.
+
+    Targeted analogue of ``_read_output_files`` for the batch path. Where
+    ``_read_output_files`` returns the first match found, this keys on the exact
+    UNIQUE SYNTHETIC name handed to ``do_parse`` (``f"{i}_{path.stem}"``), so
+    same-bare-stem files from different directories never collide.
+
+    Args:
+        output_dir: Root directory produced by a chunk's ``do_parse`` call.
+        name: The unique synthetic name handed to ``do_parse`` for this file.
+
+    Returns:
+        The file's content_list (list of block dicts), or ``[]`` on miss or
+        read error (debug-logged).
+    """
+    # NOTE: ``name`` is a filename (``f"{i}_{stem}"``) and MUST NOT be fed into
+    # a glob pattern — a stem containing glob metacharacters (``[ ] * ?``, all
+    # legal in filenames) would be mis-parsed and silently fail to match,
+    # producing spurious empty output. do_parse writes to the deterministic
+    # path ``{output_dir}/{name}/auto/{name}_content_list.json``; try that
+    # first, then fall back to a LITERAL recursive search (constant glob
+    # pattern + exact name compare) in case the layout differs by MinerU version.
+    target_filename = f"{name}_content_list.json"
+    candidates: list[Path] = [output_dir / name / "auto" / target_filename]
+    if not candidates[0].is_file():
+        candidates.extend(
+            p for p in output_dir.rglob("*_content_list.json") if p.name == target_filename
+        )
+    for jf in candidates:
+        if not jf.is_file():
+            continue
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and "content_list" in data:
+                return data["content_list"]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[parser] failed to read output file {}: {}", jf, exc)
+    return []
+
+
 def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[dict]:
     """Run MinerU in-process via ``mineru.cli.common.do_parse`` and return content_list.
 
@@ -236,22 +307,214 @@ def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[di
         out_dir = Path(tmpdir)
         # Only the content_list dump is needed; disable the other artefacts to
         # save I/O. parse_method="auto" mirrors the CLI's `-m auto`.
-        do_parse(
-            output_dir=str(out_dir),
-            pdf_file_names=[file_path.stem],
-            pdf_bytes_list=[pdf_bytes],
-            p_lang_list=["en"],
-            backend=backend,
-            parse_method="auto",
-            f_draw_layout_bbox=False,
-            f_draw_span_bbox=False,
-            f_dump_md=False,
-            f_dump_middle_json=False,
-            f_dump_model_output=False,
-            f_dump_orig_pdf=False,
-            f_dump_content_list=True,
-        )
+        # NOTE: share the inference gate so a single-file parse (incl. the
+        # per-file batch fallback) cannot run do_parse concurrently with a batch.
+        with _mineru_inference_gate():
+            do_parse(
+                output_dir=str(out_dir),
+                pdf_file_names=[file_path.stem],
+                pdf_bytes_list=[pdf_bytes],
+                p_lang_list=["en"],
+                backend=backend,
+                parse_method="auto",
+                f_draw_layout_bbox=False,
+                f_draw_span_bbox=False,
+                f_dump_md=False,
+                f_dump_middle_json=False,
+                f_dump_model_output=False,
+                f_dump_orig_pdf=False,
+                f_dump_content_list=True,
+            )
         return _read_output_files(out_dir)
+
+
+def _run_mineru_batch_chunk(
+    chunk_paths: list[Path],
+    name_map: dict[Path, str],
+    backend: str = "pipeline",
+) -> dict[Path, list[dict]]:
+    """Run exactly ONE ``do_parse`` for a chunk and return per-file content_lists.
+
+    Mirrors ``_run_mineru_inprocess`` but with a multi-item ``pdf_bytes_list``,
+    so a single inference window covers all files in the chunk. Models stay
+    resident across chunks via MinerU's pipeline ``ModelSingleton``.
+
+    Each file is handed its UNIQUE SYNTHETIC name (``name_map[path]``), and its
+    result is read back by that exact name via ``_read_content_list_for_stem``.
+
+    # WARN: ``do_parse`` mutates ``pdf_file_names`` / ``pdf_bytes_list`` (it
+    # deletes office-doc entries by index), so COPIES are always passed.
+
+    Args:
+        chunk_paths: The files in this chunk, in order.
+        name_map: Maps each path to its batch-global unique synthetic name.
+        backend: MinerU backend identifier.
+
+    Returns:
+        ``{path: content_list}`` for this chunk's files.
+
+    Raises:
+        ImportError: When the MinerU Python API is not importable.
+        Exception: Propagated from ``do_parse``; the caller (``parse_batch``)
+            owns the per-chunk fallback.
+    """
+    from mineru.cli.common import do_parse, read_fn  # noqa: PLC0415
+
+    names = [name_map[p] for p in chunk_paths]
+    # read_fn returns PDF bytes for PDFs and rasterised PDF bytes for images.
+    bytes_list = [read_fn(p) for p in chunk_paths]
+    lang_list = ["en"] * len(chunk_paths)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_dir = Path(tmpdir)
+        # NOTE: pass COPIES — do_parse mutates its name/bytes/lang inputs by index.
+        # NOTE: the inference gate serialises GPU inference across concurrent
+        # parse_batch callers; held only around do_parse, not the cheap read-back.
+        with _mineru_inference_gate():
+            do_parse(
+                output_dir=str(out_dir),
+                pdf_file_names=list(names),
+                pdf_bytes_list=list(bytes_list),
+                p_lang_list=list(lang_list),
+                backend=backend,
+                parse_method="auto",
+                f_draw_layout_bbox=False,
+                f_draw_span_bbox=False,
+                f_dump_md=False,
+                f_dump_middle_json=False,
+                f_dump_model_output=False,
+                f_dump_orig_pdf=False,
+                f_dump_content_list=True,
+            )
+        return {
+            p: _read_content_list_for_stem(out_dir, name_map[p]) for p in chunk_paths
+        }
+
+
+def _run_mineru_batch(
+    file_paths: list[Path], backend: str = "pipeline"
+) -> dict[Path, list[dict]]:
+    """Orchestrate chunked MinerU batch inference over ``file_paths``.
+
+    Thin orchestrator: computes the BATCH-GLOBAL unique name map
+    (``f"{i}_{path.stem}"`` keyed on the file's 0-based position in the full
+    ordered list), slices ``file_paths`` into chunks of ``MINERU_BATCH_SIZE``,
+    and invokes ``_run_mineru_batch_chunk`` once per chunk (one ``do_parse``
+    per chunk). Aggregates into ``{path: content_list}``.
+
+    # NOTE: This orchestrator does NOT swallow a chunk failure — a chunk's
+    # ``do_parse`` exception propagates out so the per-chunk fallback decision
+    # can live in one place (``parse_batch``).
+
+    Args:
+        file_paths: Full ordered list of uncached MinerU files to parse.
+        backend: MinerU backend identifier.
+
+    Returns:
+        ``{path: content_list}`` for every file in ``file_paths``.
+    """
+    name_map = _build_batch_name_map(file_paths)
+    chunk_size = _read_mineru_batch_size()
+    results: dict[Path, list[dict]] = {}
+    for chunk_paths in _iter_chunks(file_paths, chunk_size):
+        results.update(_run_mineru_batch_chunk(chunk_paths, name_map, backend))
+    return results
+
+
+def _iter_chunks(items: list, size: int):
+    """Yield successive ``size``-length slices of ``items``.
+
+    Single source of truth for the batch chunk slicing used by both
+    ``_run_mineru_batch`` and ``parse_batch`` so the two cannot drift.
+
+    Args:
+        items: The list to slice.
+        size: Chunk length (assumed ``>= 1``; see :func:`_read_mineru_batch_size`).
+
+    Yields:
+        Consecutive sub-lists of ``items`` of length ``size`` (the last may be shorter).
+    """
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _build_batch_name_map(file_paths: list[Path]) -> dict[Path, str]:
+    """Build the batch-global unique synthetic name map for ``do_parse``.
+
+    The synthetic name is ``f"{i}_{path.stem}"`` where ``i`` is the file's
+    0-based position in the full ordered list. This guarantees global
+    uniqueness across chunks even when two files share a bare stem, so no
+    duplicate-stem guard or ValueError is ever needed.
+
+    Args:
+        file_paths: Full ordered list of files to parse.
+
+    Returns:
+        Maps each path to its batch-global unique synthetic name.
+    """
+    return {path: f"{i}_{path.stem}" for i, path in enumerate(file_paths)}
+
+
+def _read_mineru_batch_size() -> int:
+    """Read MINERU_BATCH_SIZE from the environment, defensively.
+
+    Mirrors the ``MINERU_BACKEND`` env-var read style. A non-parseable string
+    or a value ``< 1`` falls back to the bounded default (``8``); never crashes
+    and never allows ``0``, negative, or unbounded values.
+
+    Returns:
+        A positive, bounded chunk size.
+    """
+    raw = os.environ.get("MINERU_BATCH_SIZE", str(_DEFAULT_MINERU_BATCH_SIZE))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MINERU_BATCH_SIZE
+    if value < 1:
+        return _DEFAULT_MINERU_BATCH_SIZE
+    return value
+
+
+def _read_mineru_max_inflight() -> int:
+    """Read MINERU_MAX_INFLIGHT from the environment, defensively.
+
+    Controls how many MinerU ``do_parse`` inference windows may run concurrently
+    across ALL in-process callers (default ``1`` — a single shared GPU). A
+    non-parseable string or a value ``< 1`` falls back to ``1``.
+
+    Returns:
+        A positive concurrency bound.
+    """
+    raw = os.environ.get("MINERU_MAX_INFLIGHT", str(_DEFAULT_MINERU_MAX_INFLIGHT))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MINERU_MAX_INFLIGHT
+    if value < 1:
+        return _DEFAULT_MINERU_MAX_INFLIGHT
+    return value
+
+
+def _mineru_inference_gate() -> threading.BoundedSemaphore:
+    """Return the process-wide MinerU inference gate (lazy singleton).
+
+    Serialises in-process ``do_parse`` calls across concurrent ``parse_batch``
+    invocations (and per-file fallback parses) so two batches cannot drive the
+    same GPU/``ModelSingleton`` at once. Sized from ``MINERU_MAX_INFLIGHT`` on
+    first use (default ``1``). Built under a lock so concurrent first-callers
+    create exactly one semaphore.
+
+    Returns:
+        The shared ``threading.BoundedSemaphore``.
+    """
+    global _MINERU_INFERENCE_SEMA
+    if _MINERU_INFERENCE_SEMA is None:
+        with _MINERU_INFERENCE_SEMA_LOCK:
+            if _MINERU_INFERENCE_SEMA is None:
+                _MINERU_INFERENCE_SEMA = threading.BoundedSemaphore(
+                    _read_mineru_max_inflight()
+                )
+    return _MINERU_INFERENCE_SEMA
 
 
 def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
@@ -849,174 +1112,115 @@ def _enrich_elements(
     return enriched
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _normalise_mineru_content(content_list: list[dict]) -> list[dict]:
+    """Filter non-dict blocks and normalise MinerU field aliases.
 
-
-def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutput:
-    """Parse a document and return a fully validated ParserOutput.
-
-    The function is intentionally non-raising. Every failure path — missing
-    file, unsupported type, MinerU or Docling crash, enrichment error — is
-    captured as a WarningRecord and returned in the ParserOutput.warnings list.
-
-    Supported backends (controlled by ``config.parser``):
-
-    - ``"mineru"`` (default): MinerU 3.x pipeline; accepts PDFs and images.
-    - ``"docling"``: Docling 2.x; accepts DOCX, HTML, and all MinerU formats.
-
-    Processing steps:
-    1. Validate file existence and extension.
-    2. Compute SHA-256 and check the file-based cache.
-    3. Dispatch to MinerU or Docling based on ``config.parser``.
-    4. Route each block to a typed ElementRecord.
-    5. Call the two-layer quality gate per page.
-    6. Optionally enrich modal elements via VLM (MinerU path only in v1).
-    7. Write result to cache and return.
-
-    # NOTE: The entire body is wrapped in try/except so that no unexpected
-    # exception can propagate to the caller. The outer handler produces a
-    # minimal ParserOutput carrying a backend-specific error warning code
-    # (``"docling_error"`` or ``"mineru_error"``).
+    VERBATIM extraction of the filter+normalise block previously inlined in
+    ``parse()``. Drops any item that is not a dict (debug-logging the dropped
+    count) and returns ``_normalise_aliases(b)`` for each surviving block.
+    Shared by both ``parse()`` and ``parse_batch()``.
 
     Args:
-        file_path: Path to the document file to parse.
-        config: Enrichment and backend configuration. Defaults to a
-            disabled-enrichment EnrichmentConfig when None.
+        content_list: Raw MinerU content_list, possibly containing ``None`` or
+            other non-dict entries.
+
+    Returns:
+        List of alias-normalised block dicts.
+    """
+    # NOTE: Filter out None and non-dict items before normalising aliases so
+    # that malformed MinerU output does not crash the whole pipeline.
+    valid_blocks = [b for b in content_list if isinstance(b, dict)]
+    if len(valid_blocks) < len(content_list):
+        logger.debug(
+            "[parser] skipped {} non-dict block(s) in content_list",
+            len(content_list) - len(valid_blocks),
+        )
+
+    # Normalise aliases across all valid blocks.
+    return [_normalise_aliases(b) for b in valid_blocks]
+
+
+def _route_mineru_content_list(
+    content_list: list[dict], sha256: str
+) -> list[ElementRecord]:
+    """Group normalised MinerU blocks by page and route each to an ElementRecord.
+
+    VERBATIM extraction of the page-grouping + routing block previously inlined
+    in ``parse()``. Groups blocks by ``page_idx``, computes the page count, and
+    routes each block via ``_route_block``. Per-block routing errors are
+    debug-logged and skipped (non-fatal), exactly as before.
+
+    Args:
+        content_list: Alias-normalised MinerU block dicts (already filtered).
+        sha256: SHA-256 digest of the source file, used for element IDs.
+
+    Returns:
+        ElementRecord list in page order.
+    """
+    # Group blocks by page index.
+    pages_map: dict[int, list[dict]] = {}
+    for block in content_list:
+        pidx = int(block.get("page_idx", 0))
+        pages_map.setdefault(pidx, []).append(block)
+
+    page_count_from_blocks = (max(pages_map.keys()) + 1) if pages_map else 0
+
+    # Build ElementRecord list in page order.
+    all_elements: list[ElementRecord] = []
+    element_idx = 0
+    for pidx in range(page_count_from_blocks):
+        for block in pages_map.get(pidx, []):
+            try:
+                all_elements.append(_route_block(block, pidx, element_idx, sha256))
+            except Exception as exc:  # noqa: BLE001
+                # NOTE: Per-block routing errors are non-fatal; log and skip
+                # the offending block rather than aborting the entire parse.
+                logger.debug(
+                    "[parser] skipping block at page={} idx={}: {}", pidx, element_idx, exc
+                )
+            element_idx += 1
+
+    return all_elements
+
+
+def _build_parser_output(
+    file_path: Path,
+    sha256: str,
+    elements: list[ElementRecord],
+    content_list: list[dict],
+    config: EnrichmentConfig,
+) -> ParserOutput:
+    """Assemble a ParserOutput from routed elements; non-raising by contract.
+
+    Shared by both ``parse()`` and ``parse_batch()``. Owns, identical to the
+    behaviour previously inlined in ``parse()``: Layer-1 token counts (PDF only,
+    under ``_PDFIUM_LOCK``), the per-page quality gate (``evaluate_page`` ->
+    ``quality_gate_escalation`` warnings + ``PageRecord``s), serial per-file VLM
+    enrichment (``_enrich_elements`` with the ``enrichment_not_supported`` /
+    ``enrichment_error`` guards), ``ParserOutput`` assembly, and the per-file
+    ``cache_mod.put``.
+
+    # NOTE: This helper owns its OWN outer try/except so it never propagates.
+    # On any internal failure it returns a ParserOutput carrying a
+    # backend-specific code (``docling_error`` for Docling, else ``mineru_error``).
+
+    # NOTE: ``_PDFIUM_LOCK`` is acquired ONLY inside this helper. In the batch
+    # path it is called per-file sequentially after inference, so the lock
+    # serialises cleanly with no deadlock.
+
+    Args:
+        file_path: Source document path.
+        sha256: SHA-256 digest of the source file.
+        elements: Routed ElementRecord list (MinerU- or Docling-derived).
+        content_list: Raw MinerU blocks for enrichment context (``[]`` for Docling).
+        config: Enrichment and backend configuration.
 
     Returns:
         Validated ParserOutput. Always returned — never raises.
     """
-    if config is None:
-        config = EnrichmentConfig()
-
     try:
-        # File existence check — return early with a specific warning code.
-        if not file_path.exists():
-            return ParserOutput(
-                file_path=str(file_path),
-                file_sha256="",
-                page_count=0,
-                pages=[],
-                elements=[],
-                warnings=[
-                    WarningRecord(
-                        code="file_not_found",
-                        message=f"File not found: {file_path}",
-                    )
-                ],
-                enrichment_config=config,
-            )
-
-        # Extension validation — uses the backend-aware accepted set.
-        if file_path.suffix.lower() not in _accepted_extensions(config):
-            return ParserOutput(
-                file_path=str(file_path),
-                file_sha256="",
-                page_count=0,
-                pages=[],
-                elements=[],
-                warnings=[
-                    WarningRecord(
-                        code="unsupported_type",
-                        message=f"Unsupported file extension: {file_path.suffix!r}",
-                    )
-                ],
-                enrichment_config=config,
-            )
-
-        sha256 = _file_sha256(file_path)
-
-        # NOTE: Cache-first check — avoids running the engine on already-parsed files.
-        cached = cache_mod.get(file_path)
-        if cached is not None:
-            logger.debug("[parser] cache hit for {}", file_path)
-            return cached
-
-        mineru_backend = os.environ.get("MINERU_BACKEND", "pipeline")
-
-        # Backend dispatch: Docling or MinerU path.
-        all_elements: list[ElementRecord]
+        all_elements = elements
         warnings: list[WarningRecord] = []
-        content_list: list[dict] = []
-
-        if config.parser == "docling":
-            try:
-                all_elements = _run_docling(file_path, config)
-            except Exception as exc:
-                logger.warning("[parser] Docling failed for {}: {}", file_path, exc)
-                return ParserOutput(
-                    file_path=str(file_path),
-                    file_sha256=sha256,
-                    page_count=0,
-                    pages=[],
-                    elements=[],
-                    warnings=[
-                        WarningRecord(
-                            code="docling_failed",
-                            message=f"Docling failed: {exc}",
-                        )
-                    ],
-                    enrichment_config=config,
-                )
-        else:
-            try:
-                content_list = _run_mineru(file_path, backend=mineru_backend)
-            except Exception as exc:
-                logger.warning("[parser] MinerU failed for {}: {}", file_path, exc)
-                return ParserOutput(
-                    file_path=str(file_path),
-                    file_sha256=sha256,
-                    page_count=0,
-                    pages=[],
-                    elements=[],
-                    warnings=[
-                        WarningRecord(
-                            code="mineru_failed",
-                            message=f"MinerU failed: {exc}",
-                        )
-                    ],
-                    enrichment_config=config,
-                )
-
-            # NOTE: Filter out None and non-dict items before normalising aliases so
-            # that malformed MinerU output does not crash the whole pipeline.
-            valid_blocks = [b for b in content_list if isinstance(b, dict)]
-            if len(valid_blocks) < len(content_list):
-                logger.debug(
-                    "[parser] skipped {} non-dict block(s) in content_list for {}",
-                    len(content_list) - len(valid_blocks),
-                    file_path,
-                )
-
-            # Normalise aliases across all valid blocks.
-            content_list = [_normalise_aliases(b) for b in valid_blocks]
-
-            # Group blocks by page index.
-            pages_map: dict[int, list[dict]] = {}
-            for block in content_list:
-                pidx = int(block.get("page_idx", 0))
-                pages_map.setdefault(pidx, []).append(block)
-
-            page_count_from_blocks = (max(pages_map.keys()) + 1) if pages_map else 0
-
-            # Build ElementRecord list in page order.
-            all_elements = []
-            element_idx = 0
-            for pidx in range(page_count_from_blocks):
-                for block in pages_map.get(pidx, []):
-                    try:
-                        all_elements.append(
-                            _route_block(block, pidx, element_idx, sha256)
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        # NOTE: Per-block routing errors are non-fatal; log and skip
-                        # the offending block rather than aborting the entire parse.
-                        logger.debug(
-                            "[parser] skipping block at page={} idx={}: {}", pidx, element_idx, exc
-                        )
-                    element_idx += 1
 
         # Determine page count and page map from elements.
         if all_elements:
@@ -1107,7 +1311,312 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
         cache_mod.put(file_path, output)
         return output
 
+    except Exception as exc:  # noqa: BLE001
+        # NOTE: Last-resort net for this helper — never propagate. Carries a
+        # backend-specific error code so callers stay consistent with parse().
+        logger.warning("[parser] _build_parser_output failed for {}: {}", file_path, exc)
+        error_code = "docling_error" if config.parser == "docling" else "mineru_error"
+        return ParserOutput(
+            file_path=str(file_path),
+            file_sha256=sha256,
+            page_count=0,
+            pages=[],
+            elements=[],
+            warnings=[
+                WarningRecord(
+                    code=error_code,
+                    message=f"Output assembly error: {exc}",
+                )
+            ],
+            enrichment_config=config,
+        )
+
+
+def _classify_batch_paths(
+    paths: list[Path], config: EnrichmentConfig
+) -> tuple[dict[Path, ParserOutput], dict[Path, ParserOutput], dict[Path, str]]:
+    """Classify batch paths into invalid / cache-hit / needs-parse buckets.
+
+    Synchronous and IO-bound (``_file_sha256`` reads each file in full,
+    ``cache_mod.get`` reads cache files), so ``parse_batch`` runs it via
+    ``asyncio.to_thread`` to keep the event loop responsive on large batches.
+
+    Args:
+        paths: The input paths, in order.
+        config: Shared enrichment/backend configuration (drives the accepted
+            extension set).
+
+    Returns:
+        ``(invalid_outputs, cache_hits, needs_parse)`` where ``invalid_outputs``
+        maps missing/unsupported paths to a warning ParserOutput, ``cache_hits``
+        maps paths to their cached ParserOutput, and ``needs_parse`` maps each
+        remaining path to its SHA-256 (``""`` when hashing failed — deferred to
+        the per-file ``parse()`` fallback). Insertion order is preserved.
+    """
+    invalid_outputs: dict[Path, ParserOutput] = {}
+    cache_hits: dict[Path, ParserOutput] = {}
+    needs_parse: dict[Path, str] = {}  # ordered: path -> sha256
+
+    for path in paths:
+        if not path.exists():
+            invalid_outputs[path] = ParserOutput(
+                file_path=str(path),
+                file_sha256="",
+                page_count=0,
+                pages=[],
+                elements=[],
+                warnings=[
+                    WarningRecord(
+                        code="file_not_found",
+                        message=f"File not found: {path}",
+                    )
+                ],
+                enrichment_config=config,
+            )
+            continue
+        if path.suffix.lower() not in _accepted_extensions(config):
+            invalid_outputs[path] = ParserOutput(
+                file_path=str(path),
+                file_sha256="",
+                page_count=0,
+                pages=[],
+                elements=[],
+                warnings=[
+                    WarningRecord(
+                        code="unsupported_type",
+                        message=f"Unsupported file extension: {path.suffix!r}",
+                    )
+                ],
+                enrichment_config=config,
+            )
+            continue
+        try:
+            cached = cache_mod.get(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[parser] cache lookup failed for {}: {}", path, exc)
+            cached = None
+        if cached is not None:
+            cache_hits[path] = cached
+            continue
+        try:
+            needs_parse[path] = _file_sha256(path)
+        except Exception as exc:  # noqa: BLE001
+            # NOTE: defer to per-file parse() fallback, which owns the never-raise net.
+            logger.debug("[parser] sha256 failed for {}; deferring to parse(): {}", path, exc)
+            needs_parse[path] = ""
+
+    return invalid_outputs, cache_hits, needs_parse
+
+
+def _assemble_chunk_outputs(
+    chunk_paths: list[Path],
+    name_map: dict[Path, str],
+    needs_parse: dict[Path, str],
+    backend: str,
+    config: EnrichmentConfig,
+) -> dict[Path, ParserOutput]:
+    """Run one chunk's ``do_parse`` and assemble per-file ParserOutputs.
+
+    Synchronous and CPU/GPU/IO-heavy — ``parse_batch`` runs it via
+    ``asyncio.to_thread`` so the event loop is never blocked during inference,
+    pypdfium2 token counting, or VLM enrichment.
+
+    # NOTE: This raises ONLY if the chunk's ``do_parse`` / ``read_fn`` raises;
+    # the caller (``parse_batch``) catches that and falls the chunk back to
+    # per-file ``parse()``. Per-file assembly via ``_build_parser_output`` is
+    # itself non-raising, and an empty ``content_list`` for a valid file yields
+    # a ``mineru_failed`` ParserOutput (Q4 — no silent data loss).
+
+    Args:
+        chunk_paths: Files in this chunk, in order.
+        name_map: Batch-global unique synthetic name per path.
+        needs_parse: Maps each path to its precomputed SHA-256.
+        backend: MinerU backend identifier.
+        config: Shared enrichment/backend configuration.
+
+    Returns:
+        ``{path: ParserOutput}`` for every file in ``chunk_paths``.
+
+    Raises:
+        Exception: Propagated from ``_run_mineru_batch_chunk`` (chunk inference
+            failure) so the caller can fall back per chunk.
+    """
+    chunk_results = _run_mineru_batch_chunk(chunk_paths, name_map, backend)
+    outputs: dict[Path, ParserOutput] = {}
+    for path in chunk_paths:
+        sha256 = needs_parse[path]
+        content_list = _normalise_mineru_content(chunk_results.get(path, []))
+        if not content_list:
+            # HARD requirement (Q4): no silent data loss for valid files.
+            logger.warning("[parser] do_parse produced no output for {}", path)
+            outputs[path] = ParserOutput(
+                file_path=str(path),
+                file_sha256=sha256,
+                page_count=0,
+                pages=[],
+                elements=[],
+                warnings=[
+                    WarningRecord(
+                        code="mineru_failed",
+                        message="do_parse produced no output",
+                    )
+                ],
+                enrichment_config=config,
+            )
+            continue
+        elements = _route_mineru_content_list(content_list, sha256)
+        outputs[path] = _build_parser_output(
+            path, sha256, elements, content_list, config
+        )
+    return outputs
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutput:
+    """Parse a document and return a fully validated ParserOutput.
+
+    The function is intentionally non-raising. Every failure path — missing
+    file, unsupported type, MinerU or Docling crash, enrichment error — is
+    captured as a WarningRecord and returned in the ParserOutput.warnings list.
+
+    Supported backends (controlled by ``config.parser``):
+
+    - ``"mineru"`` (default): MinerU 3.x pipeline; accepts PDFs and images.
+    - ``"docling"``: Docling 2.x; accepts DOCX, HTML, and all MinerU formats.
+
+    Processing steps:
+    1. Validate file existence and extension.
+    2. Compute SHA-256 and check the file-based cache.
+    3. Dispatch to MinerU or Docling based on ``config.parser``.
+    4. Route each block to a typed ElementRecord.
+    5. Call the two-layer quality gate per page.
+    6. Optionally enrich modal elements via VLM (MinerU path only in v1).
+    7. Write result to cache and return.
+
+    # NOTE: The body is wrapped in try/except so that no unexpected exception
+    # can propagate to the caller. The outer handler is the LAST-RESORT net
+    # producing a minimal ParserOutput with a backend-specific error code
+    # (``"docling_error"`` or ``"mineru_error"``). The dedicated engine
+    # try/except blocks below preserve the more specific ``mineru_failed`` /
+    # ``docling_failed`` codes and are NOT collapsed into that bucket.
+
+    Args:
+        file_path: Path to the document file to parse.
+        config: Enrichment and backend configuration. Defaults to a
+            disabled-enrichment EnrichmentConfig when None.
+
+    Returns:
+        Validated ParserOutput. Always returned — never raises.
+    """
+    if config is None:
+        config = EnrichmentConfig()
+
+    try:
+        # File existence check — return early with a specific warning code.
+        if not file_path.exists():
+            return ParserOutput(
+                file_path=str(file_path),
+                file_sha256="",
+                page_count=0,
+                pages=[],
+                elements=[],
+                warnings=[
+                    WarningRecord(
+                        code="file_not_found",
+                        message=f"File not found: {file_path}",
+                    )
+                ],
+                enrichment_config=config,
+            )
+
+        # Extension validation — uses the backend-aware accepted set.
+        if file_path.suffix.lower() not in _accepted_extensions(config):
+            return ParserOutput(
+                file_path=str(file_path),
+                file_sha256="",
+                page_count=0,
+                pages=[],
+                elements=[],
+                warnings=[
+                    WarningRecord(
+                        code="unsupported_type",
+                        message=f"Unsupported file extension: {file_path.suffix!r}",
+                    )
+                ],
+                enrichment_config=config,
+            )
+
+        sha256 = _file_sha256(file_path)
+
+        # NOTE: Cache-first check — avoids running the engine on already-parsed files.
+        cached = cache_mod.get(file_path)
+        if cached is not None:
+            logger.debug("[parser] cache hit for {}", file_path)
+            return cached
+
+        mineru_backend = os.environ.get("MINERU_BACKEND", "pipeline")
+
+        # Backend dispatch: Docling or MinerU path.
+        all_elements: list[ElementRecord]
+        content_list: list[dict] = []
+
+        if config.parser == "docling":
+            # NOTE: dedicated engine try/except — preserves the specific
+            # ``docling_failed`` code; not collapsed into the outer net.
+            try:
+                all_elements = _run_docling(file_path, config)
+            except Exception as exc:
+                logger.warning("[parser] Docling failed for {}: {}", file_path, exc)
+                return ParserOutput(
+                    file_path=str(file_path),
+                    file_sha256=sha256,
+                    page_count=0,
+                    pages=[],
+                    elements=[],
+                    warnings=[
+                        WarningRecord(
+                            code="docling_failed",
+                            message=f"Docling failed: {exc}",
+                        )
+                    ],
+                    enrichment_config=config,
+                )
+            content_list = []
+        else:
+            # NOTE: dedicated engine try/except — preserves the specific
+            # ``mineru_failed`` code; not collapsed into the outer net.
+            try:
+                raw = _run_mineru(file_path, backend=mineru_backend)
+            except Exception as exc:
+                logger.warning("[parser] MinerU failed for {}: {}", file_path, exc)
+                return ParserOutput(
+                    file_path=str(file_path),
+                    file_sha256=sha256,
+                    page_count=0,
+                    pages=[],
+                    elements=[],
+                    warnings=[
+                        WarningRecord(
+                            code="mineru_failed",
+                            message=f"MinerU failed: {exc}",
+                        )
+                    ],
+                    enrichment_config=config,
+                )
+
+            content_list = _normalise_mineru_content(raw)
+            all_elements = _route_mineru_content_list(content_list, sha256)
+
+        return _build_parser_output(
+            file_path, sha256, all_elements, content_list, config
+        )
+
     except Exception as exc:
+        # Last-resort never-raise net only.
         logger.warning("[parser] unhandled exception for {}: {}", file_path, exc)
         try:
             sha = _file_sha256(file_path) if file_path.exists() else ""
@@ -1135,24 +1644,136 @@ async def parse_batch(
     config: EnrichmentConfig | None = None,
     max_concurrency: int = 4,
 ) -> list[ParserOutput]:
-    """Parse multiple documents concurrently and return one result per input.
+    """Parse multiple documents and return one result per input, in input order.
 
-    Uses asyncio.Semaphore to cap concurrent MinerU invocations. Individual
-    document failures do not abort the batch — each failed path produces a
-    ParserOutput with warnings, matching the never-raise contract of parse().
+    For the MinerU backend (default), uncached files are routed through
+    chunked, single-call ``do_parse`` inference: the ordered ``needs_parse``
+    list is sliced into chunks of ``MINERU_BATCH_SIZE`` (env var, finite default
+    ``8``) and each chunk is run through ONE ``do_parse``. This costs
+    ``ceil(N / MINERU_BATCH_SIZE)`` inference windows for N uncached files
+    instead of N. A chunk whose ``do_parse`` raises falls back to per-file
+    ``parse()`` for ONLY that chunk's files. Cache hits and invalid paths bypass
+    inference entirely.
+
+    Individual document failures do not abort the batch — each failed path
+    produces a ParserOutput with warnings, matching the never-raise contract of
+    parse().
 
     Args:
         paths: List of document paths to parse.
         config: Shared enrichment and backend configuration.
-        max_concurrency: Maximum number of concurrent parse() threads.
+        max_concurrency: Maximum number of concurrent ``parse()`` threads. It
+            governs the per-file fallback (when a chunk's ``do_parse`` raises)
+            and the Docling / non-MinerU per-file path ONLY — it does NOT govern
+            MinerU batch inference concurrency. ``MINERU_BATCH_SIZE`` is the
+            separate, explicit knob for inference batching.
 
     Returns:
         List of ParserOutput instances in the same order as the input paths.
     """
+    if config is None:
+        config = EnrichmentConfig()
+
     semaphore = asyncio.Semaphore(max_concurrency)
 
     async def _parse_one(path: Path) -> ParserOutput:
         async with semaphore:
             return await asyncio.to_thread(parse, path, config)
 
-    return list(await asyncio.gather(*[_parse_one(p) for p in paths]))
+    # Non-MinerU (e.g. Docling) path is UNCHANGED: per-file fan-out.
+    if config.parser != "mineru":
+        return list(await asyncio.gather(*[_parse_one(p) for p in paths]))
+
+    mineru_backend = os.environ.get("MINERU_BACKEND", "pipeline")
+    batch_size = _read_mineru_batch_size()
+
+    # ---- STEP 1: classify all paths (offloaded — sha256 reads whole files). ----
+    # NOTE: run off the event loop; _file_sha256 reads each file in full and
+    # cache_mod.get reads cache files, so a large batch would otherwise block.
+    invalid_outputs, cache_hits, needs_parse = await asyncio.to_thread(
+        _classify_batch_paths, paths, config
+    )
+
+    # ---- STEP 2: chunked batch inference with per-chunk fallback. ----
+    parsed_outputs: dict[Path, ParserOutput] = {}
+    fallback_used = False
+
+    ordered_needs = list(needs_parse.keys())
+    name_map = _build_batch_name_map(ordered_needs)
+
+    for chunk_paths in _iter_chunks(ordered_needs, batch_size):
+        try:
+            # NOTE: the synchronous chunk work (do_parse inference, pypdfium2
+            # token counting, VLM enrichment) is offloaded to a worker thread so
+            # this async coroutine never blocks the event loop during inference.
+            chunk_outputs = await asyncio.to_thread(
+                _assemble_chunk_outputs,
+                chunk_paths,
+                name_map,
+                needs_parse,
+                mineru_backend,
+                config,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Per-chunk fallback: only THIS chunk's files fall back to parse().
+            fallback_used = True
+            logger.warning(
+                "[parser] batch chunk do_parse failed ({} files); "
+                "falling back to per-file parse(): {}",
+                len(chunk_paths),
+                exc,
+            )
+            fallback_results = await asyncio.gather(
+                *[_parse_one(p) for p in chunk_paths]
+            )
+            parsed_outputs.update(dict(zip(chunk_paths, fallback_results, strict=True)))
+            continue
+
+        parsed_outputs.update(chunk_outputs)
+
+    # ---- STEP 3: merge in original input order. ----
+    results: list[ParserOutput] = []
+    for p in paths:
+        out = invalid_outputs.get(p) or cache_hits.get(p) or parsed_outputs.get(p)
+        if out is None:
+            # NOTE: defensive — every path is classified into exactly one bucket
+            # and every needs_parse path is assembled, so this should be
+            # unreachable. Synthesise an error output rather than returning None
+            # and violating the list[ParserOutput] contract.
+            logger.warning("[parser] no output produced for {}; synthesising error", p)
+            out = ParserOutput(
+                file_path=str(p),
+                file_sha256="",
+                page_count=0,
+                pages=[],
+                elements=[],
+                warnings=[
+                    WarningRecord(
+                        code="mineru_error",
+                        message="No output produced for path in batch",
+                    )
+                ],
+                enrichment_config=config,
+            )
+        results.append(out)
+
+    # One INFO summary line per parse_batch call (whole-batch rollup).
+    # NOTE: empty_or_failed counts documents whose output carries a hard-failure
+    # warning code — a true failure count, not "zero elements" (a blank page is
+    # a clean parse) and including assembly failures (mineru_error) too.
+    empty_or_failed = sum(
+        1
+        for out in parsed_outputs.values()
+        if any(w.code in _BATCH_FAILURE_CODES for w in out.warnings)
+    )
+    logger.info(
+        "[parser] batch summary: requested={}, cache_hits={}, parsed={}, "
+        "empty_or_failed={}, fallback={}",
+        len(paths),
+        len(cache_hits),
+        len(parsed_outputs),
+        empty_or_failed,
+        fallback_used,
+    )
+
+    return results

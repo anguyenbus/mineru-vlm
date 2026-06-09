@@ -161,3 +161,64 @@ def test_invalidate(monkeypatch, tmp_path):
     assert get(p) is not None
     invalidate(p)
     assert get(p) is None
+
+
+def test_cache_round_trips_binary_image_bytes(tmp_path, monkeypatch):
+    """Regression: ParserOutput with binary image_bytes (Docling pictures) must
+    survive the JSON cache round-trip.
+
+    Before the ser/val_json_bytes="base64" fix, model_dump_json() decoded bytes
+    as UTF-8 and raised "invalid utf-8 sequence" on binary PNG bytes, so cache.put
+    silently failed and Docling-with-images results were never cached.
+    """
+    from hybrid_doc_parser import cache as cache_mod
+    from hybrid_doc_parser.models import ElementRecord, ElementType
+
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    pdf = make_pdf(tmp_path)
+
+    # Non-UTF-8 binary payload (PNG magic + every byte value).
+    png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + bytes(range(256))
+    el = ElementRecord(
+        element_id="img-0",
+        type=ElementType.image,
+        text="",
+        bbox=[],
+        page_idx=0,
+        image_bytes=png,
+    )
+    out = ParserOutput(
+        file_path=str(pdf),
+        file_sha256="b" * 64,
+        page_count=1,
+        pages=[],
+        elements=[el],
+        warnings=[],
+        enrichment_config=EnrichmentConfig(parser="docling"),
+    )
+
+    cache_mod.put(pdf, out)              # must not silently fail on binary bytes
+    got = cache_mod.get(pdf)
+
+    assert got is not None, "cache write failed for output containing image_bytes"
+    assert got.elements[0].image_bytes == png, "binary image_bytes not preserved through cache"
+
+
+def test_cache_file_written_for_image_output(tmp_path, monkeypatch):
+    """The cache .json file is actually created (no swallowed write error)."""
+    from hybrid_doc_parser import cache as cache_mod
+    from hybrid_doc_parser.models import ElementRecord, ElementType
+
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(cache_dir))
+    pdf = make_pdf(tmp_path)
+    el = ElementRecord(
+        element_id="img-0", type=ElementType.image, text="", bbox=[], page_idx=0,
+        image_bytes=bytes(range(256)),
+    )
+    out = ParserOutput(
+        file_path=str(pdf), file_sha256="c" * 64, page_count=1, pages=[],
+        elements=[el], warnings=[], enrichment_config=EnrichmentConfig(parser="docling"),
+    )
+    cache_mod.put(pdf, out)
+    assert list(cache_dir.glob("*.json")), "no cache file written for image-bearing output"

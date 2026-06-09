@@ -126,7 +126,14 @@ class ElementRecord(BaseModel):
             other element types and when enrichment is disabled.
     """
 
-    model_config = ConfigDict(frozen=True)
+    # NOTE: ``ser_json_bytes`` / ``val_json_bytes`` = "base64" so ``image_bytes``
+    # (binary PNG/JPEG, common on the Docling path) round-trips through JSON
+    # serialisation. The Pydantic v2 default ("utf8") raises on binary bytes,
+    # which previously caused every Docling-with-images ParserOutput to fail the
+    # cache write ("invalid utf-8 sequence") and silently never cache.
+    model_config = ConfigDict(
+        frozen=True, ser_json_bytes="base64", val_json_bytes="base64"
+    )
 
     element_id: str
     type: ElementType
