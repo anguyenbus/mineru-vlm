@@ -218,6 +218,11 @@ cdk.context.json
 # Streamlit
 .streamlit/
 
+# Parse Report viewer outputs — a report embeds document content and is as
+# sensitive as its source; never commit reports of confidential docs.
+parse_reports/
+*.parse_report.html
+
 # Documentation
 /site
 

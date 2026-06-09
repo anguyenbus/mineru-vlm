@@ -1308,7 +1308,7 @@ def _build_parser_output(
             enrichment_config=config,
         )
 
-        cache_mod.put(file_path, output)
+        cache_mod.put(file_path, output, config)
         return output
 
     except Exception as exc:  # noqa: BLE001
@@ -1391,7 +1391,7 @@ def _classify_batch_paths(
             )
             continue
         try:
-            cached = cache_mod.get(path)
+            cached = cache_mod.get(path, config)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[parser] cache lookup failed for {}: {}", path, exc)
             cached = None
@@ -1553,7 +1553,8 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
         sha256 = _file_sha256(file_path)
 
         # NOTE: Cache-first check — avoids running the engine on already-parsed files.
-        cached = cache_mod.get(file_path)
+        # Config is part of the key so a different backend/settings never hits.
+        cached = cache_mod.get(file_path, config)
         if cached is not None:
             logger.debug("[parser] cache hit for {}", file_path)
             return cached

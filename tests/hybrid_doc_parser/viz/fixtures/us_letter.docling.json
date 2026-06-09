@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "file_path": "us_letter.pdf",
+  "file_sha256": "abababababababababababababababababababababababababababababababab",
+  "page_count": 1,
+  "pages": [],
+  "elements": [
+    {
+      "element_id": "399ba91d-b597-555f-8ba8-b263c7436871",
+      "type": "heading",
+      "text": "# Heading",
+      "description": "",
+      "bbox": [
+        61.2,
+        673.2,
+        550.8,
+        728.64
+      ],
+      "page_idx": 0,
+      "is_enriched": false,
+      "image_bytes": null
+    },
+    {
+      "element_id": "ae30321d-ad15-5e6c-85fa-962ad7a2ff89",
+      "type": "text",
+      "text": "left column body",
+      "description": "",
+      "bbox": [
+        61.2,
+        158.4,
+        293.76,
+        633.6
+      ],
+      "page_idx": 0,
+      "is_enriched": false,
+      "image_bytes": null
+    }
+  ],
+  "warnings": [],
+  "enrichment_config": {
+    "enabled": false,
+    "image": true,
+    "table": true,
+    "equation": true,
+    "context_window": 3,
+    "max_context_tokens": 512,
+    "vlm_backend": "openai_compatible",
+    "parser": "mineru",
+    "do_ocr": true,
+    "table_mode": "fast",
+    "do_table_structure": true,
+    "docling_artifacts_path": null
+  }
+}

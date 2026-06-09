@@ -26,6 +26,7 @@ per-element **VLM enrichment**, all behind a single `parse()` / `parse_batch()` 
 - [Caching](#caching)
 - [Environment variables](#environment-variables)
 - [GPU / PyTorch notes](#gpu--pytorch-notes)
+- [Parse Report — developer debug viewer](#parse-report--developer-debug-viewer)
 - [Development](#development)
 - [Further documentation](#further-documentation)
 
@@ -300,6 +301,117 @@ uv pip install --index-url https://download.pytorch.org/whl/cu124 \
 
 To force CPU (no GPU, or a mismatched driver), set `CUDA_VISIBLE_DEVICES=""` and
 `MINERU_DEVICE_MODE=cpu`.
+
+---
+
+## Parse Report — developer debug viewer
+
+A developer-only debugging tool that renders each source page beside the units a backend
+extracted and links them with two-way hover/click highlighting. It produces one
+self-contained, offline `.html` artifact with three tabs — **MinerU / Docling / pdfplumber**
+— for eyeballing *where* each backend placed each extracted element on the page. It is a
+diagnostic aid, not part of the library API; the library never imports it.
+
+It lives in the optional `viz` dependency group:
+
+```bash
+pip install -e ".[viz]"          # pulls in pypdfium2, pdfplumber, pillow
+```
+
+### Usage — the fast loop
+
+The viewer never calls `parse()`. Parse **once**, save the `ParserOutput` JSON, then iterate
+on the report as many times as you like (it's a millisecond-scale, offline operation):
+
+```python
+# One-time, on the GPU box: produce the JSON the viewer consumes.
+from pathlib import Path
+from hybrid_doc_parser import parse, EnrichmentConfig
+
+Path("m.json").write_text(parse(Path("source.pdf")).model_dump_json())
+Path("d.json").write_text(
+    parse(Path("source.pdf"), EnrichmentConfig(parser="docling")).model_dump_json()
+)
+```
+
+```bash
+# Then iterate on the report, fast and offline:
+python scripts/parse_report.py source.pdf --mineru m.json --docling d.json -o report.html
+```
+
+Both `--mineru` and `--docling` are **optional** — one backend plus the pdfplumber baseline
+(always computed from the source PDF) is a valid report. The pdfplumber tab is produced
+automatically whenever pdfplumber is installed.
+
+Flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--mineru PATH` | — | A saved `ParserOutput` JSON for the MinerU backend (optional). |
+| `--docling PATH` | — | A saved `ParserOutput` JSON for the Docling backend (optional). |
+| `-o` / `--out PATH` | `./parse_reports/<source>.parse_report.html` | Output HTML file. |
+| `--dpi N` | `144` | Page render resolution (matches `PARSER_RENDER_DPI`). |
+| `--max-pages N` | `50` | Page cap before truncation; a **visible in-report note** appears when the document exceeds it (base64-embedding every page bloats the HTML). |
+| `--pages N-M` | (all) | Page selection — range `3-10`, single page, or comma list; 1-based, inclusive. |
+| `--selftest` | — | Emit a synthetic demo report (Pillow only, no PDF/parser deps) and exit; validates the linking UX. |
+
+Reports default to `./parse_reports/`. To validate the tool itself without any real
+document:
+
+```bash
+python scripts/parse_report.py --selftest
+```
+
+### Coordinate calibration (`COORD`) — why the boxes are trustworthy
+
+The transform from a backend's raw bbox to the canonical 0–1 top-left overlay coordinate is
+the one assumption that can make the tool *lie silently*. Each backend uses a different
+convention, locked in `viz/coords.py`:
+
+| Backend | Origin / unit | Transform to canonical 0–1 top-left |
+|---|---|---|
+| **MinerU** | top-left, **per-mille** (0–1000) | divide by 1000, **no Y-flip**; page size not needed |
+| **Docling** | bottom-left, PDF **points** | divide by page points, **flip Y** (`1 - y`) |
+| **pdfplumber** | top-left, PDF **points** | divide by page points |
+
+**pdfplumber is the known-good REFERENCE tab.** Its render + overlay pipeline was confirmed
+aligned on a real document, so it is used to calibrate MinerU and Docling: a backend's boxes
+are trusted when they land on the same regions as pdfplumber's. Rotation (`/Rotate 90`) and
+CropBox ≠ MediaBox are handled by normalizing against the page size the parser actually used
+(per-mille is page-relative and rotation-agnostic; points backends use the renderer's
+reported post-rotation size). Image inputs treat pixels as the unit — no points math. See
+`agent-os/specs/2026-06-09-parse-report-viewer/planning/calibration-notes.md` for the source
+proof and golden fixtures.
+
+### What it can and cannot tell you
+
+This viewer **shows placement and cross-backend divergence** — what each backend extracted
+and *where* it sits on the page. It does **not** prove completeness: it cannot tell you what
+a backend *missed*. Omission / coverage detection (e.g. flagging text-layer tokens no
+backend covered) is a deferred non-goal, not implemented here. The developer is the oracle;
+the tool's only job is to link extracted units to their source region accurately.
+
+### Security — a report is as sensitive as its source
+
+A generated report **embeds document content** — page images and extracted text — directly
+in the `.html`. Treat it as exactly as sensitive as the source document. The default output
+locations are `.gitignore`d (`parse_reports/` and `*.parse_report.html`); **never commit a
+report of a confidential document.** All document-derived strings are HTML-escaped and
+rendered inert (never raw HTML/markdown), and the tool writes one local file — no upload, no
+server, no open port, no telemetry.
+
+### Known issues (out of scope here)
+
+Two latent library bugs were *identified* during calibration but are **NOT fixed in this
+spec** — documented here so they aren't lost:
+
+- **`models.py` `ElementRecord.bbox` docstring** says coordinates are "PDF points with
+  bottom-left origin". This is **wrong for MinerU**, whose bboxes are per-mille (0–1000) with
+  a top-left origin. The viewer compensates via its own `COORD` table; the docstring itself
+  is unchanged here.
+- **`render.py::render_region`** has a related MinerU-crop bug stemming from the same
+  coordinate-convention confusion. Likewise documented as KNOWN and left for a future,
+  dedicated fix.
 
 ---
 

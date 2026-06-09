@@ -30,6 +30,11 @@ dev = [
 docling = [
     "docling>=2.0",
 ]
+viz = [
+    "pypdfium2",
+    "pdfplumber",
+    "pillow",
+]
 
 [build-system]
 requires = ["hatchling"]

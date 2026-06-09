@@ -222,3 +222,46 @@ def test_cache_file_written_for_image_output(tmp_path, monkeypatch):
     )
     cache_mod.put(pdf, out)
     assert list(cache_dir.glob("*.json")), "no cache file written for image-bearing output"
+
+
+def test_cache_key_isolates_by_parser_config(monkeypatch, tmp_path):
+    """The same file cached under different EnrichmentConfigs must not collide.
+
+    Regression: the key folds the config, so a MinerU entry is never served for
+    a Docling request (and vice versa), and the matching config still hits.
+    """
+    cache_dir = tmp_path / "cache"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(cache_dir))
+
+    from hybrid_doc_parser.cache import _cache_key, get, put
+
+    p = source_dir / "doc.pdf"
+    p.write_bytes(b"identical bytes")
+    mineru_cfg = EnrichmentConfig(parser="mineru")
+    docling_cfg = EnrichmentConfig(parser="docling")
+
+    # Distinct keys for distinct configs on identical bytes.
+    assert _cache_key(p, mineru_cfg) != _cache_key(p, docling_cfg)
+    # And both differ from the legacy (config=None) key.
+    assert _cache_key(p, mineru_cfg) != _cache_key(p)
+
+    mineru_out = make_output(str(p))
+    put(p, mineru_out, mineru_cfg)
+
+    # A Docling request must MISS (no cross-backend hit) ...
+    assert get(p, docling_cfg) is None
+    # ... while the matching MinerU request HITS.
+    assert get(p, mineru_cfg) is not None
+
+
+def test_cache_key_format_with_config_unchanged(tmp_path):
+    """Folding the config keeps the key FORMAT ('{32 hex}_{int}') intact."""
+    import re
+
+    from hybrid_doc_parser.cache import _cache_key
+
+    p = make_pdf(tmp_path)
+    key = _cache_key(p, EnrichmentConfig(parser="docling"))
+    assert re.match(r"^[0-9a-f]{32}_\d+$", key)

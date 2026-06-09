@@ -1,4 +1,10 @@
-"""File-based parse result cache keyed on sha256 + mtime.
+"""File-based parse result cache keyed on sha256 + mtime + parser config.
+
+The cache key folds the file content hash, its mtime, AND the
+``EnrichmentConfig`` used for the parse, so the same file parsed with different
+settings (e.g. ``parser="mineru"`` vs ``parser="docling"``, or enrichment on vs
+off) never collides — each combination is cached independently. Omitting the
+config (``config=None``) reproduces the legacy content+mtime-only key.
 
 Cache files are written atomically via a .json.tmp rename to prevent corrupt
 reads under concurrent writers. All public functions are non-raising: errors
@@ -27,7 +33,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from hybrid_doc_parser.models import ParserOutput
+from hybrid_doc_parser.models import EnrichmentConfig, ParserOutput
 
 
 def _cache_dir() -> Path:
@@ -44,23 +50,34 @@ def _cache_dir() -> Path:
     return Path(value).expanduser()
 
 
-def _cache_key(file_path: Path) -> str:
-    """Compute a stable cache key from file content hash and modification time.
+def _cache_key(file_path: Path, config: EnrichmentConfig | None = None) -> str:
+    """Compute a stable cache key from file content, mtime, and parser config.
 
-    The key encodes both the SHA-256 prefix of the file bytes and the
-    millisecond-resolution mtime so that any change — content or timestamp —
-    produces a new key.
+    The key encodes the SHA-256 prefix of the file bytes (with the
+    ``EnrichmentConfig`` folded into the same digest) plus the
+    millisecond-resolution mtime, so that any change — content, timestamp, OR
+    the config used to parse (parser backend, enrichment flags, Docling
+    options) — produces a new key. Folding the config into the digest keeps the
+    key FORMAT unchanged while making backends/settings cache independently.
 
     Args:
         file_path: Path to the source file whose content and mtime are used.
+        config: The ``EnrichmentConfig`` for this parse. When ``None`` the key
+            reproduces the legacy content+mtime-only behavior.
 
     Returns:
         String of the form ``'{sha256_prefix}_{mtime_ms}'`` where
         ``sha256_prefix`` is the first 32 hex characters of the SHA-256
         digest and ``mtime_ms`` is the integer mtime in milliseconds.
     """
-    data = file_path.read_bytes()
-    sha_prefix = hashlib.sha256(data).hexdigest()[:32]
+    hasher = hashlib.sha256()
+    hasher.update(file_path.read_bytes())
+    if config is not None:
+        # NUL separator so file-bytes and config bytes cannot run together; the
+        # frozen model serializes deterministically (stable field order).
+        hasher.update(b"\x00config\x00")
+        hasher.update(config.model_dump_json().encode("utf-8"))
+    sha_prefix = hasher.hexdigest()[:32]
     mtime_ms = int(file_path.stat().st_mtime * 1000)
     return f"{sha_prefix}_{mtime_ms}"
 
@@ -81,24 +98,28 @@ def _cache_path(key: str) -> Path:
     return _cache_dir() / f"{key[:16]}.json"
 
 
-def get(file_path: Path) -> ParserOutput | None:
+def get(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutput | None:
     """Return a cached ``ParserOutput`` for *file_path*, or ``None`` on any miss.
 
     A miss occurs when:
     - The cache file does not exist.
     - The stored ``_cache_key`` does not match the key computed from the
-      current file content and mtime (i.e. the file changed since caching).
+      current file content, mtime, and config (i.e. the file changed since
+      caching, or it was cached under a different parser config).
     - Any exception is raised during reading or deserialisation.
 
     Args:
         file_path: Path to the source file for which a cached result is sought.
+        config: The ``EnrichmentConfig`` for this parse; must match the config
+            the entry was written with (``put``) to hit. ``None`` uses the
+            legacy content+mtime-only key.
 
     Returns:
         A validated ``ParserOutput`` on cache hit, ``None`` on any miss or
         error. Never raises.
     """
     try:
-        key = _cache_key(file_path)
+        key = _cache_key(file_path, config)
         path = _cache_path(key)
         if not path.exists():
             return None
@@ -116,7 +137,9 @@ def get(file_path: Path) -> ParserOutput | None:
         return None
 
 
-def put(file_path: Path, output: ParserOutput) -> None:
+def put(
+    file_path: Path, output: ParserOutput, config: EnrichmentConfig | None = None
+) -> None:
     """Persist *output* to the cache for *file_path*. Never raises.
 
     Writes are atomic: the JSON payload is first flushed to a ``.json.tmp``
@@ -126,9 +149,14 @@ def put(file_path: Path, output: ParserOutput) -> None:
     Args:
         file_path: Path to the source file being cached.
         output: The fully-validated ``ParserOutput`` to store.
+        config: The ``EnrichmentConfig`` this result was produced with; pass the
+            SAME value to ``get`` to retrieve it. ``None`` uses the legacy
+            content+mtime-only key. (Not auto-derived from
+            ``output.enrichment_config`` so callers control key identity
+            explicitly and symmetrically with ``get``.)
     """
     try:
-        key = _cache_key(file_path)
+        key = _cache_key(file_path, config)
         cache_file = _cache_path(key)
         directory = _cache_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -146,7 +174,7 @@ def put(file_path: Path, output: ParserOutput) -> None:
         logger.warning("[cache] write error for {}: {}", file_path, exc)
 
 
-def invalidate(file_path: Path) -> None:
+def invalidate(file_path: Path, config: EnrichmentConfig | None = None) -> None:
     """Delete the cache entry for *file_path* if it exists. Never raises.
 
     Silently succeeds if no cache entry is present or if deletion fails for
@@ -154,9 +182,11 @@ def invalidate(file_path: Path) -> None:
 
     Args:
         file_path: Path to the source file whose cache entry should be removed.
+        config: The ``EnrichmentConfig`` whose entry should be removed; ``None``
+            targets the legacy content+mtime-only key.
     """
     try:
-        key = _cache_key(file_path)
+        key = _cache_key(file_path, config)
         path = _cache_path(key)
         if path.exists():
             path.unlink()
