@@ -120,7 +120,7 @@ def test_parse_element_types_routed_correctly(tmp_path, monkeypatch):
 
 
 def test_parse_batch_processes_multiple_files(tmp_path, monkeypatch):
-    """parse_batch() returns one ParserOutput per input file."""
+    """parse_batch() returns one ParserOutput per input file (via the batch path)."""
     monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
     import asyncio
     from hybrid_doc_parser.parser import parse_batch
@@ -128,7 +128,14 @@ def test_parse_batch_processes_multiple_files(tmp_path, monkeypatch):
     pdfs = [FIXTURES / "digital_simple.pdf", FIXTURES / "mixed.pdf"]
     fake_cl = _fake_content_list(1)
 
-    with mock.patch("hybrid_doc_parser.parser._run_mineru", return_value=fake_cl):
+    # NOTE: Mock the REAL batch entry point (one do_parse per chunk), not the
+    # no-MinerU per-file fallback, so this exercises the chunked batch path.
+    def _chunk(chunk_paths, name_map, backend):
+        return {p: fake_cl for p in chunk_paths}
+
+    with mock.patch(
+        "hybrid_doc_parser.parser._run_mineru_batch_chunk", side_effect=_chunk
+    ):
         results = asyncio.run(parse_batch(pdfs, EnrichmentConfig()))
 
     assert len(results) == 2
@@ -144,12 +151,21 @@ def test_parse_batch_isolates_failures(tmp_path, monkeypatch):
     pdfs = [FIXTURES / "digital_simple.pdf", Path("/nonexistent/ghost.pdf")]
     fake_cl = _fake_content_list(1)
 
-    with mock.patch("hybrid_doc_parser.parser._run_mineru", return_value=fake_cl):
+    # NOTE: Mock the REAL batch entry point. The missing file is classified as
+    # invalid before inference; the valid file flows through the chunk path.
+    def _chunk(chunk_paths, name_map, backend):
+        return {p: fake_cl for p in chunk_paths}
+
+    with mock.patch(
+        "hybrid_doc_parser.parser._run_mineru_batch_chunk", side_effect=_chunk
+    ):
         results = asyncio.run(parse_batch(pdfs, EnrichmentConfig()))
 
     assert len(results) == 2
     # nonexistent file must produce a result with warnings, not raise
     assert all(isinstance(r.file_path, str) for r in results)
+    assert results[0].elements  # the valid file parsed
+    assert any(w.code == "file_not_found" for w in results[1].warnings)
 
 
 def test_parse_nonexistent_file_returns_with_warning():
@@ -382,3 +398,222 @@ def test_parse_none_blocks_in_content_list_are_skipped(tmp_path, monkeypatch):
     assert result is not None
     # The two valid blocks should be parsed; None filtered out
     assert len(result.elements) == 2
+
+
+# ---------------------------------------------------------------------------
+# Group 1: extracted shared-helper unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalise_mineru_content_filters_non_dict():
+    """_normalise_mineru_content drops non-dict items and normalises aliases."""
+    from hybrid_doc_parser.parser import _normalise_mineru_content
+
+    raw = [
+        {"type": "image", "img_caption": "A caption", "page_idx": 0},
+        None,
+        "not-a-dict",
+        {"type": "text", "text": "hello", "page_idx": 0},
+    ]
+    result = _normalise_mineru_content(raw)
+
+    # Two non-dict items dropped.
+    assert len(result) == 2
+    # img_caption alias normalised to image_caption.
+    assert result[0]["image_caption"] == "A caption"
+    assert "img_caption" not in result[0]
+
+
+def test_route_mineru_content_list_page_grouping():
+    """_route_mineru_content_list groups by page_idx; _route_block called per block."""
+    from hybrid_doc_parser import parser as parser_mod
+    from hybrid_doc_parser.parser import _route_mineru_content_list
+
+    content_list = [
+        {"type": "text", "text": "p1 a", "page_idx": 1, "bbox": []},
+        {"type": "text", "text": "p0 a", "page_idx": 0, "bbox": []},
+        {"type": "text", "text": "p0 b", "page_idx": 0, "bbox": []},
+    ]
+
+    real_route_block = parser_mod._route_block
+    with mock.patch.object(
+        parser_mod, "_route_block", side_effect=real_route_block
+    ) as spy:
+        elements = _route_mineru_content_list(content_list, "a" * 64)
+
+    # _route_block invoked once per block.
+    assert spy.call_count == 3
+    # Output in page order: page 0 blocks first, then page 1.
+    assert [e.page_idx for e in elements] == [0, 0, 1]
+
+
+def test_route_mineru_content_list_skips_bad_blocks():
+    """A _route_block exception is skipped non-fatally; siblings still routed."""
+    from hybrid_doc_parser import parser as parser_mod
+    from hybrid_doc_parser.parser import _route_mineru_content_list
+
+    content_list = [
+        {"type": "text", "text": "good 1", "page_idx": 0, "bbox": []},
+        {"type": "text", "text": "boom", "page_idx": 0, "bbox": []},
+        {"type": "text", "text": "good 2", "page_idx": 0, "bbox": []},
+    ]
+
+    real_route_block = parser_mod._route_block
+
+    def flaky(block, page_idx, element_idx, sha):
+        if block.get("text") == "boom":
+            raise ValueError("synthetic block routing failure")
+        return real_route_block(block, page_idx, element_idx, sha)
+
+    with mock.patch.object(parser_mod, "_route_block", side_effect=flaky):
+        elements = _route_mineru_content_list(content_list, "a" * 64)
+
+    # Bad block skipped; the two good blocks survive.
+    assert len(elements) == 2
+    assert {e.text for e in elements} == {"good 1", "good 2"}
+
+
+def test_build_parser_output_quality_gate_keep(tmp_path, monkeypatch):
+    """A 'keep' quality-gate decision propagates to the PageRecord."""
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    from hybrid_doc_parser import parser as parser_mod
+    from hybrid_doc_parser.parser import (
+        _build_parser_output,
+        _normalise_mineru_content,
+        _route_mineru_content_list,
+    )
+    from hybrid_doc_parser.quality_gate import Decision
+
+    pdf = FIXTURES / "digital_simple.pdf"
+    cl = _normalise_mineru_content(_fake_content_list(1))
+    elements = _route_mineru_content_list(cl, _sha256(pdf))
+
+    with mock.patch.object(
+        parser_mod,
+        "evaluate_page",
+        return_value=Decision(action="keep", reason=None, layer=None),
+    ):
+        out = _build_parser_output(pdf, _sha256(pdf), elements, cl, EnrichmentConfig())
+
+    assert len(out.pages) == 1
+    assert out.pages[0].quality_decision == "keep"
+    assert out.pages[0].vlm_used is False
+
+
+def test_build_parser_output_quality_gate_promote(tmp_path, monkeypatch):
+    """A 'promote_to_vlm' decision adds a quality_gate_escalation warning."""
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    from hybrid_doc_parser import parser as parser_mod
+    from hybrid_doc_parser.parser import (
+        _build_parser_output,
+        _normalise_mineru_content,
+        _route_mineru_content_list,
+    )
+    from hybrid_doc_parser.quality_gate import Decision
+
+    pdf = FIXTURES / "digital_simple.pdf"
+    cl = _normalise_mineru_content(_fake_content_list(1))
+    elements = _route_mineru_content_list(cl, _sha256(pdf))
+
+    with mock.patch.object(
+        parser_mod,
+        "evaluate_page",
+        return_value=Decision(
+            action="promote_to_vlm", reason="coverage=0.10<0.40", layer=1
+        ),
+    ):
+        out = _build_parser_output(pdf, _sha256(pdf), elements, cl, EnrichmentConfig())
+
+    assert out.pages[0].quality_decision == "promote_to_vlm"
+    assert out.pages[0].vlm_used is True
+    assert any(w.code == "quality_gate_escalation" for w in out.warnings)
+
+
+def test_build_parser_output_non_pdf_skips_layer1(tmp_path, monkeypatch):
+    """Non-.pdf suffix: text_layer_tokens is not invoked under _PDFIUM_LOCK."""
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    from hybrid_doc_parser.parser import (
+        _build_parser_output,
+        _normalise_mineru_content,
+        _route_mineru_content_list,
+    )
+
+    img = tmp_path / "scan.png"
+    img.write_bytes(b"fake png bytes")
+    cl = _normalise_mineru_content(
+        [{"type": "text", "text": "hello world", "page_idx": 0, "bbox": []}]
+    )
+    elements = _route_mineru_content_list(cl, "a" * 64)
+
+    with mock.patch(
+        "hybrid_doc_parser.render.text_layer_tokens"
+    ) as mock_tokens:
+        out = _build_parser_output(img, "a" * 64, elements, cl, EnrichmentConfig())
+
+    mock_tokens.assert_not_called()
+    assert out is not None
+
+
+def test_build_parser_output_enrichment_not_supported_docling(tmp_path, monkeypatch):
+    """Docling + enrichment enabled adds an enrichment_not_supported warning."""
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    from hybrid_doc_parser.parser import _build_parser_output
+
+    img = tmp_path / "doc.png"
+    img.write_bytes(b"fake png bytes")
+    config = EnrichmentConfig(parser="docling", enabled=True)
+
+    out = _build_parser_output(img, "a" * 64, [], [], config)
+
+    assert any(w.code == "enrichment_not_supported" for w in out.warnings)
+
+
+def test_build_parser_output_never_raises(tmp_path, monkeypatch):
+    """An internal exception yields a ParserOutput with mineru_error/docling_error."""
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    from hybrid_doc_parser import parser as parser_mod
+    from hybrid_doc_parser.parser import (
+        _build_parser_output,
+        _normalise_mineru_content,
+        _route_mineru_content_list,
+    )
+
+    pdf = FIXTURES / "digital_simple.pdf"
+    cl = _normalise_mineru_content(_fake_content_list(1))
+    elements = _route_mineru_content_list(cl, _sha256(pdf))
+
+    with mock.patch.object(
+        parser_mod, "evaluate_page", side_effect=RuntimeError("boom")
+    ):
+        out_mineru = _build_parser_output(
+            pdf, _sha256(pdf), elements, cl, EnrichmentConfig()
+        )
+        out_docling = _build_parser_output(
+            pdf, _sha256(pdf), elements, cl, EnrichmentConfig(parser="docling")
+        )
+
+    assert out_mineru is not None
+    assert any(w.code == "mineru_error" for w in out_mineru.warnings)
+    assert out_docling is not None
+    assert any(w.code == "docling_error" for w in out_docling.warnings)
+
+
+def test_build_parser_output_writes_cache(tmp_path, monkeypatch):
+    """_build_parser_output calls cache_mod.put once with the assembled output."""
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+    from hybrid_doc_parser.parser import (
+        _build_parser_output,
+        _normalise_mineru_content,
+        _route_mineru_content_list,
+    )
+
+    pdf = FIXTURES / "digital_simple.pdf"
+    cl = _normalise_mineru_content(_fake_content_list(1))
+    elements = _route_mineru_content_list(cl, _sha256(pdf))
+
+    with mock.patch("hybrid_doc_parser.cache.put") as mock_put:
+        out = _build_parser_output(pdf, _sha256(pdf), elements, cl, EnrichmentConfig())
+
+    mock_put.assert_called_once()
+    called_args = mock_put.call_args.args
+    assert called_args[1] is out
