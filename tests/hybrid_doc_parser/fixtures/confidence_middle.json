@@ -1,0 +1,92 @@
+{
+    "pdf_info": [
+        {
+            "preproc_blocks": [
+                {
+                    "score": 0.8124,
+                    "bbox": [
+                        46,
+                        30,
+                        599,
+                        46
+                    ],
+                    "index": 1,
+                    "type": "text",
+                    "lines": [
+                        {
+                            "bbox": [
+                                48,
+                                28,
+                                597,
+                                46
+                            ],
+                            "spans": [
+                                {
+                                    "bbox": [
+                                        48,
+                                        28,
+                                        597,
+                                        46
+                                    ],
+                                    "type": "text",
+                                    "content": "This is a digital PDF document with extractable text. It contains multiple sentences for testing purposes.",
+                                    "score": 1.0
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            "page_idx": 0,
+            "page_size": [
+                612,
+                792
+            ],
+            "discarded_blocks": [],
+            "para_blocks": [
+                {
+                    "score": 0.8124,
+                    "bbox": [
+                        46,
+                        30,
+                        599,
+                        46
+                    ],
+                    "index": 1,
+                    "type": "text",
+                    "lines": [
+                        {
+                            "bbox": [
+                                48,
+                                28,
+                                597,
+                                46
+                            ],
+                            "spans": [
+                                {
+                                    "bbox": [
+                                        48,
+                                        28,
+                                        597,
+                                        46
+                                    ],
+                                    "type": "text",
+                                    "content": "This is a digital PDF document with extractable text. It contains multiple sentences for testing purposes.",
+                                    "score": 1.0
+                                }
+                            ]
+                        }
+                    ],
+                    "bbox_fs": [
+                        48,
+                        28,
+                        597,
+                        46
+                    ]
+                }
+            ]
+        }
+    ],
+    "_backend": "pipeline",
+    "_version_name": "3.2.3"
+}

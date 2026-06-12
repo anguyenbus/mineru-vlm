@@ -79,9 +79,7 @@ _DOCLING_LABEL_MAP: Final[dict[str, ElementType]] = {
     "list_item": ElementType.list_item,
 }
 
-_DOCLING_EXTENSIONS: Final[frozenset[str]] = frozenset(
-    {".docx", ".doc", ".html", ".htm", ".xhtml"}
-)
+_DOCLING_EXTENSIONS: Final[frozenset[str]] = frozenset({".docx", ".doc", ".html", ".htm", ".xhtml"})
 
 # NOTE: pypdfium2's underlying libpdfium C library is not thread-safe.
 # All calls that open or iterate PDF documents must be serialized with this lock
@@ -275,6 +273,48 @@ def _read_content_list_for_stem(output_dir: Path, name: str) -> list[dict]:
     return []
 
 
+def _read_middle_json_for_stem(output_dir: Path, name: str) -> dict | None:
+    """Read one file's MinerU ``_middle.json`` by its unique synthetic name.
+
+    Direct analogue of ``_read_content_list_for_stem`` for the pipeline
+    ``_middle.json`` dump (which carries block layout-detection and span
+    OCR-recognition scores). Keys on the exact UNIQUE SYNTHETIC name handed to
+    ``do_parse`` so same-bare-stem files from different directories never
+    collide. Best-effort and non-raising.
+
+    Args:
+        output_dir: Root directory produced by a chunk's ``do_parse`` call.
+        name: The unique synthetic name handed to ``do_parse`` for this file.
+
+    Returns:
+        The parsed middle_json ``dict`` on a hit (via either the deterministic
+        path or the recursive fallback), or ``None`` on a miss / read error /
+        corrupt or non-dict JSON (debug-logged). Never raises.
+    """
+    # NOTE: ``name`` is a filename (``f"{i}_{stem}"``) and MUST NOT be fed into
+    # a glob pattern — a stem containing glob metacharacters (``[ ] * ?``, all
+    # legal in filenames) would be mis-parsed and silently fail to match.
+    # do_parse writes to the deterministic path
+    # ``{output_dir}/{name}/auto/{name}_middle.json``; try that first, then fall
+    # back to a LITERAL recursive search (constant glob pattern + exact name
+    # compare) in case the layout differs by MinerU version.
+    target_filename = f"{name}_middle.json"
+    candidates: list[Path] = [output_dir / name / "auto" / target_filename]
+    if not candidates[0].is_file():
+        candidates.extend(p for p in output_dir.rglob("*_middle.json") if p.name == target_filename)
+    for jf in candidates:
+        if not jf.is_file():
+            continue
+        try:
+            data = json.loads(jf.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[parser] failed to read middle_json {}: {}", jf, exc)
+    logger.debug("[parser] middle_json not found for name {} in {}", name, output_dir)
+    return None
+
+
 def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[dict]:
     """Run MinerU in-process via ``mineru.cli.common.do_parse`` and return content_list.
 
@@ -320,11 +360,16 @@ def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[di
                 f_draw_layout_bbox=False,
                 f_draw_span_bbox=False,
                 f_dump_md=False,
-                f_dump_middle_json=False,
+                f_dump_middle_json=True,
                 f_dump_model_output=False,
                 f_dump_orig_pdf=False,
                 f_dump_content_list=True,
             )
+        # Capture the dumped _middle.json (layout/OCR confidence scores) inside
+        # the tempdir before it is cleaned up. This slice only CAPTURES the
+        # dict — it is not yet returned or persisted downstream; wiring it into
+        # ParserOutput/cache lands in roadmap item 22. None on miss/corrupt.
+        _middle_json = _read_middle_json_for_stem(out_dir, file_path.stem)
         return _read_output_files(out_dir)
 
 
@@ -381,19 +426,24 @@ def _run_mineru_batch_chunk(
                 f_draw_layout_bbox=False,
                 f_draw_span_bbox=False,
                 f_dump_md=False,
-                f_dump_middle_json=False,
+                f_dump_middle_json=True,
                 f_dump_model_output=False,
                 f_dump_orig_pdf=False,
                 f_dump_content_list=True,
             )
-        return {
-            p: _read_content_list_for_stem(out_dir, name_map[p]) for p in chunk_paths
+        # Capture each file's dumped _middle.json inside the tempdir, keyed on
+        # the SAME unique synthetic name (name_map[p]) the content_list read-back
+        # uses so same-bare-stem files never collide. This slice only CAPTURES
+        # the dicts — they are not yet returned or persisted downstream; wiring
+        # them into ParserOutput/cache lands in roadmap item 22. None on
+        # miss/corrupt, which never breaks the content_list return path.
+        _middle_json_by_path = {
+            p: _read_middle_json_for_stem(out_dir, name_map[p]) for p in chunk_paths
         }
+        return {p: _read_content_list_for_stem(out_dir, name_map[p]) for p in chunk_paths}
 
 
-def _run_mineru_batch(
-    file_paths: list[Path], backend: str = "pipeline"
-) -> dict[Path, list[dict]]:
+def _run_mineru_batch(file_paths: list[Path], backend: str = "pipeline") -> dict[Path, list[dict]]:
     """Orchestrate chunked MinerU batch inference over ``file_paths``.
 
     Thin orchestrator: computes the BATCH-GLOBAL unique name map
@@ -511,9 +561,7 @@ def _mineru_inference_gate() -> threading.BoundedSemaphore:
     if _MINERU_INFERENCE_SEMA is None:
         with _MINERU_INFERENCE_SEMA_LOCK:
             if _MINERU_INFERENCE_SEMA is None:
-                _MINERU_INFERENCE_SEMA = threading.BoundedSemaphore(
-                    _read_mineru_max_inflight()
-                )
+                _MINERU_INFERENCE_SEMA = threading.BoundedSemaphore(_read_mineru_max_inflight())
     return _MINERU_INFERENCE_SEMA
 
 
@@ -713,9 +761,7 @@ def _route_docling_block(
             else:
                 image_bytes = decoded_bytes
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[docling] base64 decode failed for element {}: {}", element_idx, exc
-            )
+            logger.warning("[docling] base64 decode failed for element {}: {}", element_idx, exc)
             image_bytes = None
 
     else:
@@ -793,8 +839,8 @@ def _get_docling_converter(config: EnrichmentConfig) -> Any:
         from docling.document_converter import DocumentConverter  # noqa: PLC0415
 
         try:
-            from docling.datamodel.pipeline_options import PdfPipelineOptions  # noqa: PLC0415
             from docling.datamodel.base_models import InputFormat  # noqa: PLC0415
+            from docling.datamodel.pipeline_options import PdfPipelineOptions  # noqa: PLC0415
             from docling.document_converter import PdfFormatOption  # noqa: PLC0415
 
             pipeline_options = PdfPipelineOptions()
@@ -1103,9 +1149,7 @@ def _enrich_elements(
             description = eq_proc.process(block, i, None)
 
         if should_enrich and description:
-            element = element.model_copy(
-                update={"description": description, "is_enriched": True}
-            )
+            element = element.model_copy(update={"description": description, "is_enriched": True})
 
         enriched.append(element)
 
@@ -1140,9 +1184,7 @@ def _normalise_mineru_content(content_list: list[dict]) -> list[dict]:
     return [_normalise_aliases(b) for b in valid_blocks]
 
 
-def _route_mineru_content_list(
-    content_list: list[dict], sha256: str
-) -> list[ElementRecord]:
+def _route_mineru_content_list(content_list: list[dict], sha256: str) -> list[ElementRecord]:
     """Group normalised MinerU blocks by page and route each to an ElementRecord.
 
     VERBATIM extraction of the page-grouping + routing block previously inlined
@@ -1241,9 +1283,7 @@ def _build_parser_output(
 
         # Non-PDF Layer 1 skip: log once at file level for observability.
         if is_non_pdf:
-            logger.debug(
-                "[quality_gate] skipping Layer 1 for non-PDF input: {}", file_path
-            )
+            logger.debug("[quality_gate] skipping Layer 1 for non-PDF input: {}", file_path)
 
         # Quality gate evaluation per page.
         page_records: list[PageRecord] = []
@@ -1286,9 +1326,7 @@ def _build_parser_output(
             )
         elif config.enabled:
             try:
-                all_elements = _enrich_elements(
-                    all_elements, content_list, config, file_path
-                )
+                all_elements = _enrich_elements(all_elements, content_list, config, file_path)
             except Exception as exc:
                 logger.warning("[parser] enrichment failed for {}: {}", file_path, exc)
                 warnings.append(
@@ -1465,9 +1503,7 @@ def _assemble_chunk_outputs(
             )
             continue
         elements = _route_mineru_content_list(content_list, sha256)
-        outputs[path] = _build_parser_output(
-            path, sha256, elements, content_list, config
-        )
+        outputs[path] = _build_parser_output(path, sha256, elements, content_list, config)
     return outputs
 
 
@@ -1612,9 +1648,7 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
             content_list = _normalise_mineru_content(raw)
             all_elements = _route_mineru_content_list(content_list, sha256)
 
-        return _build_parser_output(
-            file_path, sha256, all_elements, content_list, config
-        )
+        return _build_parser_output(file_path, sha256, all_elements, content_list, config)
 
     except Exception as exc:
         # Last-resort never-raise net only.
@@ -1724,9 +1758,7 @@ async def parse_batch(
                 len(chunk_paths),
                 exc,
             )
-            fallback_results = await asyncio.gather(
-                *[_parse_one(p) for p in chunk_paths]
-            )
+            fallback_results = await asyncio.gather(*[_parse_one(p) for p in chunk_paths])
             parsed_outputs.update(dict(zip(chunk_paths, fallback_results, strict=True)))
             continue
 
