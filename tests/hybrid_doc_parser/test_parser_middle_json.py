@@ -192,10 +192,12 @@ def test_inprocess_flips_middle_json_flag_and_keeps_fast_path(tmp_path):
 
     fake = _FakeMineruModule(_on)
     with fake:
-        result = _run_mineru_inprocess(pdf, backend="pipeline")
+        content_list, middle_json = _run_mineru_inprocess(pdf, backend="pipeline")
 
     # Content_list fast path is unchanged.
-    assert result and result[0]["text"].startswith("Page 0")
+    assert content_list and content_list[0]["text"].startswith("Page 0")
+    # The captured middle_json is now SURFACED alongside the content_list.
+    assert middle_json == {"pdf_info": [{"page_idx": 0}]}
     fake.do_parse_mock.assert_called_once()
 
 
@@ -237,9 +239,12 @@ def test_batch_chunk_reads_middle_json_per_unique_name(tmp_path, monkeypatch):
     with fake:
         results = _run_mineru_batch_chunk(paths, name_map, backend="pipeline")
 
-    # Content_list read-back fast path is unchanged.
+    # Content_list read-back fast path is unchanged; each value is now a pair.
     assert set(results.keys()) == set(paths)
-    assert all(results[p] for p in paths)
+    assert all(results[p][0] for p in paths)
+    # The middle_json is surfaced as the second element of each pair.
+    assert results[paths[0]][1]["_name"] == name_map[paths[0]]
+    assert results[paths[1]][1]["_name"] == name_map[paths[1]]
     # The middle_json was read back keyed on the SAME synthetic name.
     assert captured[name_map[paths[0]]]["_name"] == name_map[paths[0]]
     assert captured[name_map[paths[1]]]["_name"] == name_map[paths[1]]
@@ -266,6 +271,58 @@ def test_batch_chunk_missing_middle_json_does_not_break_content_list(tmp_path):
     with fake:
         results = _run_mineru_batch_chunk(paths, name_map, backend="pipeline")
 
-    # The content_list return path is unaffected by the absent middle_json.
-    assert results[paths[0]]
-    assert results[paths[0]][0]["text"].startswith("Page 0")
+    # The content_list return path is unaffected by the absent middle_json;
+    # the value is a (content_list, None) pair when no middle_json was captured.
+    content_list, middle_json = results[paths[0]]
+    assert content_list
+    assert middle_json is None
+    assert content_list[0]["text"].startswith("Page 0")
+
+
+# ---------------------------------------------------------------------------
+# Group 3 (item 22): _split_mineru_result tolerant "list-or-pair" unpack
+# ---------------------------------------------------------------------------
+
+
+def test_split_mineru_result_pair():
+    """A (content_list, middle_json) pair is returned unchanged."""
+    from hybrid_doc_parser.parser import _split_mineru_result
+
+    content = [{"type": "text", "text": "x"}]
+    middle = {"pdf_info": [{"page_idx": 0}]}
+    assert _split_mineru_result((content, middle)) == (content, middle)
+
+
+def test_split_mineru_result_bare_list():
+    """A bare content_list yields (content_list, None) — the mock-compatible path."""
+    from hybrid_doc_parser.parser import _split_mineru_result
+
+    content = [{"type": "text", "text": "x"}]
+    assert _split_mineru_result(content) == (content, None)
+
+
+def test_split_mineru_result_pair_with_none_middle():
+    """A (content_list, None) pair yields (content_list, None)."""
+    from hybrid_doc_parser.parser import _split_mineru_result
+
+    content = [{"type": "text", "text": "x"}]
+    assert _split_mineru_result((content, None)) == (content, None)
+
+
+def test_split_mineru_result_batch_bare_value():
+    """A per-path bare list (batch dict value) splits to (content_list, None)."""
+    from hybrid_doc_parser.parser import _split_mineru_result
+
+    # The batch {path: value} map is split per value upstream; a bare list value
+    # must still yield middle_json=None so existing batch mocks keep working.
+    content = [{"type": "text", "text": "x"}]
+    assert _split_mineru_result(content) == (content, None)
+
+
+def test_split_mineru_result_unexpected_shape_degrades():
+    """An unexpected shape degrades to ([], None) rather than raising."""
+    from hybrid_doc_parser.parser import _split_mineru_result
+
+    assert _split_mineru_result(None) == ([], None)
+    assert _split_mineru_result(42) == ([], None)
+    assert _split_mineru_result("nonsense") == ([], None)

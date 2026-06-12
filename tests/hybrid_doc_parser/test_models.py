@@ -8,8 +8,6 @@ Run in isolation:
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
-
 from hybrid_doc_parser.models import (
     SCHEMA_VERSION,
     ElementRecord,
@@ -19,6 +17,7 @@ from hybrid_doc_parser.models import (
     ParserOutput,
     WarningRecord,
 )
+from pydantic import ValidationError
 
 
 class TestElementType:
@@ -40,7 +39,9 @@ class TestElementType:
             "unknown",
         }
         actual = {member.value for member in ElementType}
-        assert actual == expected, f"Missing or extra members: {actual.symmetric_difference(expected)}"
+        assert (
+            actual == expected
+        ), f"Missing or extra members: {actual.symmetric_difference(expected)}"
 
     def test_element_type_is_str_subclass(self) -> None:
         """ElementType members must be usable as plain strings."""
@@ -117,7 +118,7 @@ class TestElementRecord:
         assert record.is_enriched is False
 
     def test_description_defaults_to_empty_string(self) -> None:
-        """description must default to empty string when not explicitly set."""
+        """Description must default to empty string when not explicitly set."""
         record = ElementRecord(
             element_id="abc",
             type=ElementType.table,
@@ -162,11 +163,11 @@ class TestParserOutputFrozen:
 
 
 class TestParserOutputSchemaVersion:
-    """Test 6: ParserOutput.schema_version defaults to '1.0'; SCHEMA_VERSION == '1.0'."""
+    """Test 6: ParserOutput.schema_version defaults to '1.1'; SCHEMA_VERSION == '1.1'."""
 
     def test_schema_version_constant(self) -> None:
-        """Module-level SCHEMA_VERSION must equal '1.0'."""
-        assert SCHEMA_VERSION == "1.0"
+        """Module-level SCHEMA_VERSION must equal '1.1'."""
+        assert SCHEMA_VERSION == "1.1"
 
     def test_schema_version_default(self) -> None:
         """ParserOutput without explicit schema_version must default to SCHEMA_VERSION."""
@@ -179,7 +180,7 @@ class TestParserOutputSchemaVersion:
             warnings=[],
             enrichment_config=EnrichmentConfig(),
         )
-        assert output.schema_version == "1.0"
+        assert output.schema_version == "1.1"
 
 
 class TestParserOutputRoundTrip:
@@ -208,7 +209,7 @@ class TestParserOutputRoundTrip:
             message="test warning",
         )
         original = ParserOutput(
-            schema_version="1.0",
+            schema_version="1.1",
             file_path="/abs/path/doc.pdf",
             file_sha256="c" * 64,
             page_count=1,
@@ -249,3 +250,77 @@ class TestWarningRecordNullPageIdx:
             message="render_region raised ValueError",
         )
         assert warning.page_idx == 3
+
+
+class TestParserOutputConfidenceField:
+    """Group 1: the nullable confidence field on ParserOutput."""
+
+    def test_confidence_defaults_none(self) -> None:
+        """A default-constructed ParserOutput has confidence is None."""
+        output = ParserOutput(
+            file_path="/tmp/doc.pdf",
+            file_sha256="d" * 64,
+            page_count=0,
+            pages=[],
+            elements=[],
+            warnings=[],
+            enrichment_config=EnrichmentConfig(),
+        )
+        assert output.confidence is None
+
+    def test_confidence_round_trip(self) -> None:
+        """A populated DocumentConfidence round-trips via model_dump_json/model_validate_json."""
+        from hybrid_doc_parser.confidence import DocumentConfidence, PageConfidence
+
+        page = PageConfidence(
+            page_idx=0,
+            block_count=2,
+            mean_block_score=0.91,
+            min_block_score=0.85,
+            low_confidence_blocks=0,
+            span_count=3,
+            mean_span_score=0.88,
+            min_span_score=0.80,
+            low_confidence_spans=0,
+            discarded_block_count=0,
+            discarded_mean_block_score=None,
+            discarded_min_block_score=None,
+            discarded_low_confidence_blocks=0,
+            discarded_span_count=0,
+            discarded_mean_span_score=None,
+            discarded_min_span_score=None,
+            discarded_low_confidence_spans=0,
+            flagged=False,
+        )
+        confidence = DocumentConfidence(
+            total_pages=1,
+            pages=[page],
+            overall_mean_block_score=0.91,
+            overall_mean_span_score=0.88,
+            overall_min_block_score=0.85,
+            overall_min_span_score=0.80,
+            low_confidence_blocks=0,
+            low_confidence_spans=0,
+            pages_flagged=[],
+            version_name="2.0.0",
+            backend="pipeline",
+            source_path="/abs/path/doc.pdf",
+        )
+        original = ParserOutput(
+            file_path="/abs/path/doc.pdf",
+            file_sha256="e" * 64,
+            page_count=1,
+            pages=[],
+            elements=[],
+            warnings=[],
+            enrichment_config=EnrichmentConfig(),
+            confidence=confidence,
+        )
+
+        restored = ParserOutput.model_validate_json(original.model_dump_json())
+
+        assert restored == original
+        assert restored.confidence is not None
+        assert restored.confidence.total_pages == 1
+        assert restored.confidence.source_path == "/abs/path/doc.pdf"
+        assert restored.confidence.pages[0].mean_block_score == 0.91

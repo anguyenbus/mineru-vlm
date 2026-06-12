@@ -346,3 +346,56 @@ def test_extract_confidence_from_path_reads_and_degrades(tmp_path) -> None:
     corrupt.write_text("{not json", encoding="utf-8")
     d_corrupt = extract_confidence_from_path(corrupt)
     assert d_corrupt.total_pages == 0
+
+
+# ---------------------------------------------------------------------------
+# merge_discarded flag: fold the discarded bucket into the headline aggregates
+# ---------------------------------------------------------------------------
+
+
+def test_merge_discarded_folds_into_headline_and_empties_bucket() -> None:
+    """merge_discarded=True counts discarded blocks in the headline; bucket -> 0."""
+    page = _page(
+        0,
+        para_blocks=[_simple_block(0.9, 0.95)],
+        discarded_blocks=[_simple_block(0.8, 0.99), _simple_block(0.6, 0.97)],
+    )
+    doc = extract_confidence(_middle(page), merge_discarded=True)
+    p = doc.pages[0]
+    # Headline now spans the para block + both discarded blocks.
+    assert p.block_count == 3
+    assert p.span_count == 3
+    assert p.mean_block_score == (0.9 + 0.8 + 0.6) / 3
+    assert p.low_confidence_blocks == 1  # the 0.6 block is below 0.70
+    # The discarded bucket reports empty.
+    assert p.discarded_block_count == 0
+    assert p.discarded_mean_block_score is None
+    assert p.discarded_span_count == 0
+
+
+def test_merge_discarded_default_false_keeps_bucket_separate() -> None:
+    """Default (no flag) is unchanged: discarded stays its own bucket."""
+    page = _page(
+        0,
+        para_blocks=[_simple_block(0.9, 0.95)],
+        discarded_blocks=[_simple_block(0.2, 0.1)],
+    )
+    doc = extract_confidence(_middle(page))
+    p = doc.pages[0]
+    assert p.block_count == 1
+    assert p.discarded_block_count == 1
+    assert p.discarded_mean_block_score == 0.2
+
+
+def test_merge_discarded_can_flag_page_via_merged_blocks() -> None:
+    """A low-scoring discarded block can pull the merged headline below threshold."""
+    page = _page(
+        0,
+        para_blocks=[_simple_block(0.72, 0.99)],  # alone: mean 0.72, not flagged
+        discarded_blocks=[_simple_block(0.30, 0.99)],  # merged: mean 0.51 -> flagged
+    )
+    separate = extract_confidence(_middle(page))
+    merged = extract_confidence(_middle(page), merge_discarded=True)
+    assert separate.pages[0].flagged is False
+    assert merged.pages[0].flagged is True
+    assert merged.pages_flagged == [0]

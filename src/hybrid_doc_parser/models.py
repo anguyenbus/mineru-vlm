@@ -18,11 +18,15 @@ from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# NOTE: import direction is strictly ``models <- confidence`` — ``confidence.py``
+# imports nothing from this module, so there is NO import cycle.
+from hybrid_doc_parser.confidence import DocumentConfidence
+
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION: Final[str] = "1.0"
+SCHEMA_VERSION: Final[str] = "1.1"
 """Current schema version for ParserOutput serialisation."""
 
 
@@ -131,9 +135,7 @@ class ElementRecord(BaseModel):
     # serialisation. The Pydantic v2 default ("utf8") raises on binary bytes,
     # which previously caused every Docling-with-images ParserOutput to fail the
     # cache write ("invalid utf-8 sequence") and silently never cache.
-    model_config = ConfigDict(
-        frozen=True, ser_json_bytes="base64", val_json_bytes="base64"
-    )
+    model_config = ConfigDict(frozen=True, ser_json_bytes="base64", val_json_bytes="base64")
 
     element_id: str
     type: ElementType
@@ -176,7 +178,8 @@ class WarningRecord(BaseModel):
             ``"mineru_failed"``, ``"docling_failed"``, ``"vlm_failed"``,
             ``"quality_gate_error"``, ``"cache_write_error"``,
             ``"render_failed"``, ``"enrichment_not_supported"``,
-            ``"image_too_large"``, ``"docling_error"``, ``"mineru_error"``.
+            ``"image_too_large"``, ``"docling_error"``, ``"mineru_error"``,
+            ``"confidence_unavailable"``.
         message: Human-readable description of the problem.
     """
 
@@ -200,7 +203,7 @@ class ParserOutput(BaseModel):
 
     Attributes:
         schema_version: Serialisation schema version; defaults to
-            ``SCHEMA_VERSION`` (``"1.0"``).
+            ``SCHEMA_VERSION`` (``"1.1"``).
         file_path: Absolute resolved path of the parsed file as a string.
         file_sha256: Full 64-character lowercase hex SHA-256 digest of the
             file bytes at parse time.
@@ -210,6 +213,11 @@ class ParserOutput(BaseModel):
         warnings: Non-fatal diagnostics collected during parsing; an empty
             list indicates a clean parse.
         enrichment_config: The ``EnrichmentConfig`` used for this parse run.
+        confidence: MinerU layout/OCR confidence aggregates for this document,
+            or ``None``. Populated ONLY on the MinerU PIPELINE path with a
+            usable ``_middle.json``; ``None`` for Docling / mineru-vlm (no
+            scores exist) and for unwired / mock paths (no ``middle_json``
+            surfaced).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -222,3 +230,4 @@ class ParserOutput(BaseModel):
     elements: list[ElementRecord]
     warnings: list[WarningRecord]
     enrichment_config: EnrichmentConfig
+    confidence: DocumentConfidence | None = None

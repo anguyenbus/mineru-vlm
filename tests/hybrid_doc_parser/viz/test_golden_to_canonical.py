@@ -170,7 +170,7 @@ def _load(name: str) -> ParserOutput:
 def test_golden_json_mineru_first_element_matches() -> None:
     """The synthesized MinerU JSON loads via Pydantic and matches the golden."""
     po = _load("us_letter.mineru.json")
-    assert po.schema_version == "1.0"
+    assert po.schema_version == "1.1"
     raw = po.elements[0].bbox
     _approx(to_canonical(raw, "mineru"), (0.25, 0.10, 0.75, 0.20))
 

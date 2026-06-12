@@ -1,11 +1,10 @@
 """End-to-end integration tests for the hybrid-doc-parser pipeline."""
+
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 import unittest.mock as mock
-
-import pytest
+from pathlib import Path
 
 from hybrid_doc_parser.models import ElementType, EnrichmentConfig
 
@@ -15,34 +14,41 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def _fake_content_list(page_count: int = 1, include_table: bool = False) -> list[dict]:
     blocks = []
     for i in range(page_count):
-        blocks.append({
-            "type": "title",
-            "text": f"Section {i + 1}",
-            "page_idx": i,
-            "page_size": [595.0, 842.0],
-            "bbox": [50.0, 750.0, 545.0, 780.0],
-        })
-        blocks.append({
-            "type": "text",
-            "text": "This is a realistic paragraph with enough words to satisfy the quality gate heuristics.",
-            "page_idx": i,
-            "page_size": [595.0, 842.0],
-            "bbox": [50.0, 700.0, 545.0, 740.0],
-        })
-        if include_table:
-            blocks.append({
-                "type": "table",
-                "text": "<table><tr><th>Col A</th><th>Col B</th></tr><tr><td>1</td><td>2</td></tr></table>",
+        blocks.append(
+            {
+                "type": "title",
+                "text": f"Section {i + 1}",
                 "page_idx": i,
                 "page_size": [595.0, 842.0],
-                "bbox": [50.0, 600.0, 545.0, 680.0],
-            })
+                "bbox": [50.0, 750.0, 545.0, 780.0],
+            }
+        )
+        blocks.append(
+            {
+                "type": "text",
+                "text": "This is a realistic paragraph with enough words to satisfy the quality gate heuristics.",
+                "page_idx": i,
+                "page_size": [595.0, 842.0],
+                "bbox": [50.0, 700.0, 545.0, 740.0],
+            }
+        )
+        if include_table:
+            blocks.append(
+                {
+                    "type": "table",
+                    "text": "<table><tr><th>Col A</th><th>Col B</th></tr><tr><td>1</td><td>2</td></tr></table>",
+                    "page_idx": i,
+                    "page_size": [595.0, 842.0],
+                    "bbox": [50.0, 600.0, 545.0, 680.0],
+                }
+            )
     return blocks
 
 
 # ---------------------------------------------------------------------------
 # Integration tests
 # ---------------------------------------------------------------------------
+
 
 def test_parse_digital_simple_no_enrichment(monkeypatch, tmp_path):
     """parse() on a digital PDF returns elements and no fatal warnings."""
@@ -55,7 +61,7 @@ def test_parse_digital_simple_no_enrichment(monkeypatch, tmp_path):
 
     assert result.page_count == 1
     assert len(result.elements) >= 1
-    assert result.schema_version == "1.0"
+    assert result.schema_version == "1.1"
     # No critical (non-escalation) warnings
     fatal = [w for w in result.warnings if w.code not in {"quality_gate_escalation"}]
     assert fatal == []
@@ -114,10 +120,34 @@ def test_parse_furniture_filtered_from_markdown(monkeypatch, tmp_path):
     from hybrid_doc_parser import parse, render_markdown
 
     fake_cl = [
-        {"type": "header", "text": "Document Title Header", "page_idx": 0, "page_size": [595.0, 842.0], "bbox": [0, 800, 595, 840]},
-        {"type": "footer", "text": "Confidential", "page_idx": 0, "page_size": [595.0, 842.0], "bbox": [0, 0, 595, 40]},
-        {"type": "page_number", "text": "1", "page_idx": 0, "page_size": [595.0, 842.0], "bbox": [280, 0, 315, 20]},
-        {"type": "text", "text": "Real content paragraph here.", "page_idx": 0, "page_size": [595.0, 842.0], "bbox": [50, 600, 545, 640]},
+        {
+            "type": "header",
+            "text": "Document Title Header",
+            "page_idx": 0,
+            "page_size": [595.0, 842.0],
+            "bbox": [0, 800, 595, 840],
+        },
+        {
+            "type": "footer",
+            "text": "Confidential",
+            "page_idx": 0,
+            "page_size": [595.0, 842.0],
+            "bbox": [0, 0, 595, 40],
+        },
+        {
+            "type": "page_number",
+            "text": "1",
+            "page_idx": 0,
+            "page_size": [595.0, 842.0],
+            "bbox": [280, 0, 315, 20],
+        },
+        {
+            "type": "text",
+            "text": "Real content paragraph here.",
+            "page_idx": 0,
+            "page_size": [595.0, 842.0],
+            "bbox": [50, 600, 545, 640],
+        },
     ]
     with mock.patch("hybrid_doc_parser.parser._run_mineru", return_value=fake_cl):
         result = parse(FIXTURES / "digital_simple.pdf", EnrichmentConfig())
@@ -155,9 +185,9 @@ def test_parse_never_raises_on_corrupt_content_list(monkeypatch, tmp_path):
 
     # Return a list with badly-formed blocks
     bad_cl = [
-        {"type": None, "text": 12345},       # bad types
-        {"missing_type_key": True},           # no type key
-        None,                                 # None item
+        {"type": None, "text": 12345},  # bad types
+        {"missing_type_key": True},  # no type key
+        None,  # None item
     ]
     with mock.patch("hybrid_doc_parser.parser._run_mineru", return_value=bad_cl):
         result = parse(FIXTURES / "digital_simple.pdf", EnrichmentConfig())

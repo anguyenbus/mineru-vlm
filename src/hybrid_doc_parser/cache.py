@@ -28,12 +28,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from loguru import logger
 
-from hybrid_doc_parser.models import EnrichmentConfig, ParserOutput
+from hybrid_doc_parser.models import SCHEMA_VERSION, EnrichmentConfig, ParserOutput
 
 
 def _cache_dir() -> Path:
@@ -54,11 +54,14 @@ def _cache_key(file_path: Path, config: EnrichmentConfig | None = None) -> str:
     """Compute a stable cache key from file content, mtime, and parser config.
 
     The key encodes the SHA-256 prefix of the file bytes (with the
-    ``EnrichmentConfig`` folded into the same digest) plus the
-    millisecond-resolution mtime, so that any change — content, timestamp, OR
-    the config used to parse (parser backend, enrichment flags, Docling
-    options) — produces a new key. Folding the config into the digest keeps the
-    key FORMAT unchanged while making backends/settings cache independently.
+    ``EnrichmentConfig`` AND the ``SCHEMA_VERSION`` folded into the same
+    digest) plus the millisecond-resolution mtime, so that any change —
+    content, timestamp, the config used to parse (parser backend, enrichment
+    flags, Docling options), OR a schema-version bump — produces a new key.
+    Folding the schema version into the digest is load-bearing: it invalidates
+    every pre-bump cache entry (so stale results from an older schema are never
+    served) while keeping the key FORMAT unchanged. Folding the config keeps
+    backends/settings caching independently.
 
     Args:
         file_path: Path to the source file whose content and mtime are used.
@@ -77,6 +80,10 @@ def _cache_key(file_path: Path, config: EnrichmentConfig | None = None) -> str:
         # frozen model serializes deterministically (stable field order).
         hasher.update(b"\x00config\x00")
         hasher.update(config.model_dump_json().encode("utf-8"))
+    # Fold the schema version into the digest (NOT the returned key string) so a
+    # SCHEMA_VERSION bump invalidates every pre-bump cache entry.
+    hasher.update(b"\x00schema\x00")
+    hasher.update(SCHEMA_VERSION.encode("utf-8"))
     sha_prefix = hasher.hexdigest()[:32]
     mtime_ms = int(file_path.stat().st_mtime * 1000)
     return f"{sha_prefix}_{mtime_ms}"
@@ -137,9 +144,7 @@ def get(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutput
         return None
 
 
-def put(
-    file_path: Path, output: ParserOutput, config: EnrichmentConfig | None = None
-) -> None:
+def put(file_path: Path, output: ParserOutput, config: EnrichmentConfig | None = None) -> None:
     """Persist *output* to the cache for *file_path*. Never raises.
 
     Writes are atomic: the JSON payload is first flushed to a ``.json.tmp``
@@ -163,7 +168,7 @@ def put(
 
         data = json.loads(output.model_dump_json())
         data["_cache_key"] = key
-        data["_cached_at"] = datetime.now(tz=timezone.utc).isoformat()
+        data["_cached_at"] = datetime.now(tz=UTC).isoformat()
 
         json_text = json.dumps(data, ensure_ascii=False)
         # NOTE Write to a .tmp sibling first, then rename for atomicity.

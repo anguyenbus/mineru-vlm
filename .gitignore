@@ -220,6 +220,9 @@ cdk.context.json
 
 # Parse Report viewer outputs — a report embeds document content and is as
 # sensitive as its source; never commit reports of confidential docs.
+# `make report <file>` writes everything under report/<file-stem>/ (m.json,
+# d.json, and the HTML report).
+report/
 parse_reports/
 *.parse_report.html
 

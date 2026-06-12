@@ -30,7 +30,7 @@ from hybrid_doc_parser.viz.render import select_pages
 _CFG = EnrichmentConfig()
 
 
-def _po(elements: list[ElementRecord], schema_version: str = "1.0") -> ParserOutput:
+def _po(elements: list[ElementRecord], schema_version: str = "1.1") -> ParserOutput:
     return ParserOutput(
         schema_version=schema_version,
         file_path="x.pdf",

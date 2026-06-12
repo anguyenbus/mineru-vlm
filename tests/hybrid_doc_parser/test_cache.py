@@ -6,8 +6,6 @@ import json
 import unittest.mock as mock
 from pathlib import Path
 
-import pytest
-
 from hybrid_doc_parser.models import EnrichmentConfig, ParserOutput
 
 
@@ -70,7 +68,7 @@ def test_cache_path_suffix(monkeypatch, tmp_path):
 
 
 def test_put_get_roundtrip(monkeypatch, tmp_path):
-    """put followed by get returns an equivalent ParserOutput."""
+    """Put followed by get returns an equivalent ParserOutput."""
     cache_dir = tmp_path / "cache"
     source_dir = tmp_path / "source"
     source_dir.mkdir()
@@ -89,7 +87,7 @@ def test_put_get_roundtrip(monkeypatch, tmp_path):
 
 
 def test_get_miss(monkeypatch, tmp_path):
-    """get returns None when no cache entry exists for the file."""
+    """Get returns None when no cache entry exists for the file."""
     cache_dir = tmp_path / "cache"
     source_dir = tmp_path / "source"
     source_dir.mkdir()
@@ -104,7 +102,7 @@ def test_get_miss(monkeypatch, tmp_path):
 
 
 def test_get_key_mismatch(monkeypatch, tmp_path):
-    """get returns None when the stored _cache_key does not match the computed key."""
+    """Get returns None when the stored _cache_key does not match the computed key."""
     cache_dir = tmp_path / "cache"
     source_dir = tmp_path / "source"
     source_dir.mkdir()
@@ -129,7 +127,7 @@ def test_get_key_mismatch(monkeypatch, tmp_path):
 
 
 def test_put_never_raises(monkeypatch, tmp_path):
-    """put does not propagate exceptions even when mkdir fails with PermissionError."""
+    """Put does not propagate exceptions even when mkdir fails with PermissionError."""
     source_dir = tmp_path / "source"
     source_dir.mkdir()
     monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
@@ -146,7 +144,7 @@ def test_put_never_raises(monkeypatch, tmp_path):
 
 
 def test_invalidate(monkeypatch, tmp_path):
-    """invalidate deletes the cache entry so subsequent get returns None."""
+    """Invalidate deletes the cache entry so subsequent get returns None."""
     cache_dir = tmp_path / "cache"
     source_dir = tmp_path / "source"
     source_dir.mkdir()
@@ -197,7 +195,7 @@ def test_cache_round_trips_binary_image_bytes(tmp_path, monkeypatch):
         enrichment_config=EnrichmentConfig(parser="docling"),
     )
 
-    cache_mod.put(pdf, out)              # must not silently fail on binary bytes
+    cache_mod.put(pdf, out)  # must not silently fail on binary bytes
     got = cache_mod.get(pdf)
 
     assert got is not None, "cache write failed for output containing image_bytes"
@@ -213,12 +211,21 @@ def test_cache_file_written_for_image_output(tmp_path, monkeypatch):
     monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(cache_dir))
     pdf = make_pdf(tmp_path)
     el = ElementRecord(
-        element_id="img-0", type=ElementType.image, text="", bbox=[], page_idx=0,
+        element_id="img-0",
+        type=ElementType.image,
+        text="",
+        bbox=[],
+        page_idx=0,
         image_bytes=bytes(range(256)),
     )
     out = ParserOutput(
-        file_path=str(pdf), file_sha256="c" * 64, page_count=1, pages=[],
-        elements=[el], warnings=[], enrichment_config=EnrichmentConfig(parser="docling"),
+        file_path=str(pdf),
+        file_sha256="c" * 64,
+        page_count=1,
+        pages=[],
+        elements=[el],
+        warnings=[],
+        enrichment_config=EnrichmentConfig(parser="docling"),
     )
     cache_mod.put(pdf, out)
     assert list(cache_dir.glob("*.json")), "no cache file written for image-bearing output"
@@ -265,3 +272,46 @@ def test_cache_key_format_with_config_unchanged(tmp_path):
     p = make_pdf(tmp_path)
     key = _cache_key(p, EnrichmentConfig(parser="docling"))
     assert re.match(r"^[0-9a-f]{32}_\d+$", key)
+
+
+def test_pre_bump_entry_is_miss_after_schema_bump(monkeypatch, tmp_path):
+    """A cache entry written under schema_version '1.0' (old digest) is a MISS after the bump.
+
+    The schema version is folded into the _cache_key digest, so an entry stored
+    under the pre-bump key is never served once SCHEMA_VERSION advances.
+    """
+    cache_dir = tmp_path / "cache"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    cache_dir.mkdir()
+    monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(cache_dir))
+
+    import hashlib
+
+    from hybrid_doc_parser.cache import _cache_path, get
+
+    p = source_dir / "doc.pdf"
+    p.write_bytes(b"pdf content here")
+    config = EnrichmentConfig()
+
+    # Reconstruct the OLD (pre-bump) digest: file bytes + config fold + schema "1.0".
+    hasher = hashlib.sha256()
+    hasher.update(p.read_bytes())
+    hasher.update(b"\x00config\x00")
+    hasher.update(config.model_dump_json().encode("utf-8"))
+    hasher.update(b"\x00schema\x00")
+    hasher.update(b"1.0")
+    old_sha = hasher.hexdigest()[:32]
+    import os
+
+    old_mtime_ms = int(os.stat(p).st_mtime * 1000)
+    old_key = f"{old_sha}_{old_mtime_ms}"
+
+    # Persist a stale entry under the old key.
+    output = make_output(str(p))
+    data = json.loads(output.model_dump_json())
+    data["_cache_key"] = old_key
+    _cache_path(old_key).write_text(json.dumps(data), encoding="utf-8")
+
+    # After the bump, the computed key differs -> MISS, the stale entry is never served.
+    assert get(p, config) is None

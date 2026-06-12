@@ -17,7 +17,7 @@ This makes the golden ``to_canonical`` assertions exact and fully offline. The
 one human/GPU step that remains is the live visual-eyeball confirmation that
 real boxes align in all three tabs on a real document.
 
-Each emitted file is a real ``ParserOutput.model_dump_json()`` (schema 1.0), so
+Each emitted file is a real ``ParserOutput.model_dump_json()`` (schema 1.1), so
 Group 2's Pydantic-backed ``doc_from_parser_output`` can consume them as-is.
 """
 

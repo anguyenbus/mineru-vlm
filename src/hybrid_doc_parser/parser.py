@@ -33,6 +33,7 @@ from typing import Any, Final
 from loguru import logger
 
 import hybrid_doc_parser.cache as cache_mod
+from hybrid_doc_parser.confidence import extract_confidence
 from hybrid_doc_parser.models import (
     ElementRecord,
     ElementType,
@@ -315,8 +316,10 @@ def _read_middle_json_for_stem(output_dir: Path, name: str) -> dict | None:
     return None
 
 
-def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[dict]:
-    """Run MinerU in-process via ``mineru.cli.common.do_parse`` and return content_list.
+def _run_mineru_inprocess(
+    file_path: Path, backend: str = "pipeline"
+) -> tuple[list[dict], dict | None]:
+    """Run MinerU in-process via ``mineru.cli.common.do_parse``; return (content_list, middle_json).
 
     This is the fast path: unlike the CLI subprocess fallback, it keeps the
     heavy detection/OCR/table/formula models resident in this process across
@@ -332,8 +335,10 @@ def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[di
         backend: MinerU backend identifier (e.g. ``pipeline``).
 
     Returns:
-        The MinerU content_list (list of block dicts), or an empty list when
-        no content was produced.
+        A ``(content_list, middle_json | None)`` pair: the MinerU content_list
+        (list of block dicts; empty list when no content was produced) and the
+        captured pipeline ``_middle.json`` dict (layout/OCR confidence scores),
+        or ``None`` when none was captured (miss / corrupt).
 
     Raises:
         ImportError: When the MinerU Python API is not importable.
@@ -366,19 +371,19 @@ def _run_mineru_inprocess(file_path: Path, backend: str = "pipeline") -> list[di
                 f_dump_content_list=True,
             )
         # Capture the dumped _middle.json (layout/OCR confidence scores) inside
-        # the tempdir before it is cleaned up. This slice only CAPTURES the
-        # dict — it is not yet returned or persisted downstream; wiring it into
-        # ParserOutput/cache lands in roadmap item 22. None on miss/corrupt.
-        _middle_json = _read_middle_json_for_stem(out_dir, file_path.stem)
-        return _read_output_files(out_dir)
+        # the tempdir before it is cleaned up, and SURFACE it alongside the
+        # content_list as a deliberate "list-or-pair" union. ``middle_json`` is
+        # None on miss/corrupt, which never breaks the content_list return path.
+        middle_json = _read_middle_json_for_stem(out_dir, file_path.stem)
+        return _read_output_files(out_dir), middle_json
 
 
 def _run_mineru_batch_chunk(
     chunk_paths: list[Path],
     name_map: dict[Path, str],
     backend: str = "pipeline",
-) -> dict[Path, list[dict]]:
-    """Run exactly ONE ``do_parse`` for a chunk and return per-file content_lists.
+) -> dict[Path, tuple[list[dict], dict | None]]:
+    """Run exactly ONE ``do_parse`` for a chunk; return per-file (content_list, middle_json).
 
     Mirrors ``_run_mineru_inprocess`` but with a multi-item ``pdf_bytes_list``,
     so a single inference window covers all files in the chunk. Models stay
@@ -396,7 +401,10 @@ def _run_mineru_batch_chunk(
         backend: MinerU backend identifier.
 
     Returns:
-        ``{path: content_list}`` for this chunk's files.
+        ``{path: (content_list, middle_json | None)}`` for this chunk's files —
+        each value a deliberate "list-or-pair" union carrying the captured
+        pipeline ``_middle.json`` dict (or ``None`` on miss/corrupt) alongside
+        the content_list, keyed on the same path.
 
     Raises:
         ImportError: When the MinerU Python API is not importable.
@@ -433,24 +441,31 @@ def _run_mineru_batch_chunk(
             )
         # Capture each file's dumped _middle.json inside the tempdir, keyed on
         # the SAME unique synthetic name (name_map[p]) the content_list read-back
-        # uses so same-bare-stem files never collide. This slice only CAPTURES
-        # the dicts — they are not yet returned or persisted downstream; wiring
-        # them into ParserOutput/cache lands in roadmap item 22. None on
-        # miss/corrupt, which never breaks the content_list return path.
-        _middle_json_by_path = {
+        # uses so same-bare-stem files never collide, and SURFACE it alongside
+        # each content_list as a deliberate "list-or-pair" union per path. None
+        # on miss/corrupt, which never breaks the content_list return path.
+        middle_json_by_path = {
             p: _read_middle_json_for_stem(out_dir, name_map[p]) for p in chunk_paths
         }
-        return {p: _read_content_list_for_stem(out_dir, name_map[p]) for p in chunk_paths}
+        return {
+            p: (
+                _read_content_list_for_stem(out_dir, name_map[p]),
+                middle_json_by_path[p],
+            )
+            for p in chunk_paths
+        }
 
 
-def _run_mineru_batch(file_paths: list[Path], backend: str = "pipeline") -> dict[Path, list[dict]]:
+def _run_mineru_batch(
+    file_paths: list[Path], backend: str = "pipeline"
+) -> dict[Path, tuple[list[dict], dict | None]]:
     """Orchestrate chunked MinerU batch inference over ``file_paths``.
 
     Thin orchestrator: computes the BATCH-GLOBAL unique name map
     (``f"{i}_{path.stem}"`` keyed on the file's 0-based position in the full
     ordered list), slices ``file_paths`` into chunks of ``MINERU_BATCH_SIZE``,
     and invokes ``_run_mineru_batch_chunk`` once per chunk (one ``do_parse``
-    per chunk). Aggregates into ``{path: content_list}``.
+    per chunk). Aggregates into ``{path: (content_list, middle_json | None)}``.
 
     # NOTE: This orchestrator does NOT swallow a chunk failure — a chunk's
     # ``do_parse`` exception propagates out so the per-chunk fallback decision
@@ -461,11 +476,13 @@ def _run_mineru_batch(file_paths: list[Path], backend: str = "pipeline") -> dict
         backend: MinerU backend identifier.
 
     Returns:
-        ``{path: content_list}`` for every file in ``file_paths``.
+        ``{path: (content_list, middle_json | None)}`` for every file in
+        ``file_paths`` — each value the "list-or-pair" union from the chunk
+        runner.
     """
     name_map = _build_batch_name_map(file_paths)
     chunk_size = _read_mineru_batch_size()
-    results: dict[Path, list[dict]] = {}
+    results: dict[Path, tuple[list[dict], dict | None]] = {}
     for chunk_paths in _iter_chunks(file_paths, chunk_size):
         results.update(_run_mineru_batch_chunk(chunk_paths, name_map, backend))
     return results
@@ -565,8 +582,8 @@ def _mineru_inference_gate() -> threading.BoundedSemaphore:
     return _MINERU_INFERENCE_SEMA
 
 
-def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
-    """Invoke MinerU and return its content_list output.
+def _run_mineru(file_path: Path, backend: str = "pipeline") -> tuple[list[dict], dict | None]:
+    """Invoke MinerU and return ``(content_list, middle_json | None)``.
 
     Attempts the MinerU Python API first. Falls back to the CLI subprocess
     when the Python API is not importable.
@@ -583,7 +600,10 @@ def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
         backend: MinerU backend identifier passed to the API or CLI.
 
     Returns:
-        List of block dicts representing the document content_list.
+        A ``(content_list, middle_json | None)`` pair — a deliberate
+        "list-or-pair" union. The in-process path surfaces the captured
+        pipeline ``_middle.json`` dict; the CLI fallback has no ``_middle.json``
+        and returns ``(content, None)``.
 
     Raises:
         RuntimeError: When both the Python API and CLI fallback fail.
@@ -597,9 +617,9 @@ def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
     #
     # NOTE: imported lazily so `mineru` is not a hard import-time dependency.
     try:
-        content = _run_mineru_inprocess(file_path, backend=backend)
+        content, middle_json = _run_mineru_inprocess(file_path, backend=backend)
         if content:
-            return content
+            return content, middle_json
         logger.debug("[parser] in-process MinerU returned no content; trying CLI fallback")
     except ImportError:
         logger.debug("[parser] MinerU Python API not importable; trying CLI fallback")
@@ -630,7 +650,8 @@ def _run_mineru(file_path: Path, backend: str = "pipeline") -> list[dict]:
                 logger.info("[MinerU] {}", line)
             content = _read_output_files(out_dir)
             if content:
-                return content
+                # CLI fallback has no captured _middle.json -> middle_json is None.
+                return content, None
     except Exception as exc:
         raise RuntimeError(f"MinerU CLI failed: {exc}") from exc
 
@@ -1156,6 +1177,44 @@ def _enrich_elements(
     return enriched
 
 
+def _split_mineru_result(value: object) -> tuple[list[dict], dict | None]:
+    """Tolerantly unpack a runner result into ``(content_list, middle_json | None)``.
+
+    The MinerU runners (and the ~15 existing test mocks) return one of two
+    shapes — a deliberate "list-or-pair" union:
+
+    - the real pair ``(content_list, middle_json | None)`` produced by the
+      wired runners, or
+    - a bare ``content_list`` (the historical shape that mocks still return).
+
+    For the batch path, the ``{path: value}`` map is split per value upstream,
+    so each per-path ``value`` is itself one of the two shapes above.
+
+    A bare list yields ``middle_json=None``. This helper is defensive and
+    NEVER raises: an unexpected shape degrades to ``([], None)`` rather than
+    propagating, preserving the package's never-raises contract.
+
+    Args:
+        value: A runner result — either the ``(content_list, middle_json)``
+            pair or a bare ``content_list``.
+
+    Returns:
+        A ``(content_list, middle_json | None)`` tuple. ``middle_json`` is
+        ``None`` for a bare list or any unexpected input.
+    """
+    # Pair shape: a 2-tuple/2-list of (content_list, middle_json|None).
+    if isinstance(value, tuple) and len(value) == 2:  # noqa: PLR2004
+        content, middle = value
+        content_list = content if isinstance(content, list) else []
+        middle_json = middle if isinstance(middle, dict) else None
+        return content_list, middle_json
+    # Bare content_list shape (mock / unwired path): middle_json is absent.
+    if isinstance(value, list):
+        return value, None
+    # Unexpected shape: degrade safely rather than raise.
+    return [], None
+
+
 def _normalise_mineru_content(content_list: list[dict]) -> list[dict]:
     """Filter non-dict blocks and normalise MinerU field aliases.
 
@@ -1231,6 +1290,7 @@ def _build_parser_output(
     elements: list[ElementRecord],
     content_list: list[dict],
     config: EnrichmentConfig,
+    middle_json: dict | None = None,
 ) -> ParserOutput:
     """Assemble a ParserOutput from routed elements; non-raising by contract.
 
@@ -1256,6 +1316,10 @@ def _build_parser_output(
         elements: Routed ElementRecord list (MinerU- or Docling-derived).
         content_list: Raw MinerU blocks for enrichment context (``[]`` for Docling).
         config: Enrichment and backend configuration.
+        middle_json: The captured MinerU pipeline ``_middle.json`` dict, or
+            ``None``. Aggregated into ``ParserOutput.confidence`` ONLY on the
+            MinerU pipeline path; ``None`` (and ``confidence=None``) for Docling
+            / mineru-vlm and for unwired / mock paths.
 
     Returns:
         Validated ParserOutput. Always returned — never raises.
@@ -1336,6 +1400,33 @@ def _build_parser_output(
                     )
                 )
 
+        # Confidence decision table (MinerU PIPELINE only). Lives INSIDE this
+        # helper's outer try/except so a malformed middle_json can never break
+        # assembly — it degrades to confidence=None per the table below.
+        #   (a) parser != "mineru"            -> None, no warning
+        #   (b) mineru, middle_json absent     -> None, no warning (mock/unwired)
+        #   (c) mineru, present-but-unusable   -> None + confidence_unavailable
+        #   (d) mineru, usable (total_pages>0) -> populated, source_path set
+        confidence = None
+        if config.parser == "mineru" and middle_json is not None:
+            # extract_confidence is pure / never-raising and uses its FROZEN
+            # item-21 defaults (merge_discarded=False, threshold=0.70).
+            doc_confidence = extract_confidence(middle_json)
+            if doc_confidence.total_pages > 0:
+                confidence = doc_confidence.model_copy(update={"source_path": str(file_path)})
+            else:
+                # Captured a dump but it aggregated to nothing usable — a real
+                # degradation signal. NOT a batch-failure code.
+                warnings.append(
+                    WarningRecord(
+                        code="confidence_unavailable",
+                        message=(
+                            "MinerU pipeline confidence requested but the captured "
+                            "_middle.json was missing, corrupt, or empty"
+                        ),
+                    )
+                )
+
         output = ParserOutput(
             file_path=str(file_path),
             file_sha256=sha256,
@@ -1344,6 +1435,7 @@ def _build_parser_output(
             elements=all_elements,
             warnings=warnings,
             enrichment_config=config,
+            confidence=confidence,
         )
 
         cache_mod.put(file_path, output, config)
@@ -1483,7 +1575,8 @@ def _assemble_chunk_outputs(
     outputs: dict[Path, ParserOutput] = {}
     for path in chunk_paths:
         sha256 = needs_parse[path]
-        content_list = _normalise_mineru_content(chunk_results.get(path, []))
+        raw_content, middle_json = _split_mineru_result(chunk_results.get(path, []))
+        content_list = _normalise_mineru_content(raw_content)
         if not content_list:
             # HARD requirement (Q4): no silent data loss for valid files.
             logger.warning("[parser] do_parse produced no output for {}", path)
@@ -1503,7 +1596,9 @@ def _assemble_chunk_outputs(
             )
             continue
         elements = _route_mineru_content_list(content_list, sha256)
-        outputs[path] = _build_parser_output(path, sha256, elements, content_list, config)
+        outputs[path] = _build_parser_output(
+            path, sha256, elements, content_list, config, middle_json=middle_json
+        )
     return outputs
 
 
@@ -1600,6 +1695,9 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
         # Backend dispatch: Docling or MinerU path.
         all_elements: list[ElementRecord]
         content_list: list[dict] = []
+        # middle_json is only ever populated on the MinerU pipeline path; stays
+        # None for Docling and for the MinerU CLI-fallback / mock paths.
+        middle_json: dict | None = None
 
         if config.parser == "docling":
             # NOTE: dedicated engine try/except — preserves the specific
@@ -1645,10 +1743,13 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
                     enrichment_config=config,
                 )
 
-            content_list = _normalise_mineru_content(raw)
+            raw_content, middle_json = _split_mineru_result(raw)
+            content_list = _normalise_mineru_content(raw_content)
             all_elements = _route_mineru_content_list(content_list, sha256)
 
-        return _build_parser_output(file_path, sha256, all_elements, content_list, config)
+        return _build_parser_output(
+            file_path, sha256, all_elements, content_list, config, middle_json=middle_json
+        )
 
     except Exception as exc:
         # Last-resort never-raise net only.

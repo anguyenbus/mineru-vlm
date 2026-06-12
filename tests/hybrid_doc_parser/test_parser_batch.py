@@ -195,9 +195,10 @@ def test_run_mineru_batch_reads_per_unique_name(tmp_path, monkeypatch):
     with fake:
         results = _run_mineru_batch(paths, backend="pipeline")
 
-    assert results[paths[0]][0]["text"] == "AAA"
-    assert results[paths[1]][0]["text"] == "BBB"
-    assert results[paths[2]][0]["text"] == "CCC"
+    # Each value is now a (content_list, middle_json | None) pair.
+    assert results[paths[0]][0][0]["text"] == "AAA"
+    assert results[paths[1]][0][0]["text"] == "BBB"
+    assert results[paths[2]][0][0]["text"] == "CCC"
 
 
 def test_run_mineru_batch_passes_copies_to_do_parse(tmp_path, monkeypatch):
@@ -256,9 +257,10 @@ def test_run_mineru_batch_same_bare_stem_maps_correctly(tmp_path, monkeypatch):
     with fake:
         results = _run_mineru_batch([p1, p2], backend="pipeline")
 
-    # No ValueError; each file maps to its own distinct output.
-    assert results[p1][0]["text"] == "FIRST"
-    assert results[p2][0]["text"] == "SECOND"
+    # No ValueError; each file maps to its own distinct (content_list, middle_json)
+    # pair — _run_mineru_batch surfaces the per-file middle_json alongside content.
+    assert results[p1][0][0]["text"] == "FIRST"
+    assert results[p2][0][0]["text"] == "SECOND"
 
 
 def test_run_mineru_batch_chunk_failure_isolated(tmp_path, monkeypatch):

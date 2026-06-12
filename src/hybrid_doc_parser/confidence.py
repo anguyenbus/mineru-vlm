@@ -273,18 +273,37 @@ def _select_headline_blocks(page: dict) -> object:
     return page.get("preproc_blocks")
 
 
+def _as_block_list(blocks: object) -> list:
+    """Coerce a possibly-missing/ill-typed block collection to a list."""
+    return blocks if isinstance(blocks, list) else []
+
+
 # ---------------------------------------------------------------------------
 # Public aggregation entry points
 # ---------------------------------------------------------------------------
 
 
-def _build_page_confidence(page: dict, threshold: float) -> PageConfidence:
-    """Aggregate one ``pdf_info`` page into a :class:`PageConfidence`."""
+def _build_page_confidence(page: dict, threshold: float, merge_discarded: bool) -> PageConfidence:
+    """Aggregate one ``pdf_info`` page into a :class:`PageConfidence`.
+
+    When ``merge_discarded`` is ``True``, the page's ``discarded_blocks``
+    (headers/footers/page-numbers/asides/footnotes MinerU filters out) are
+    folded into the headline aggregates and the ``discarded_*`` bucket reports
+    empty (``count == 0``, ``None`` mean/min). When ``False`` (the default), the
+    discarded bucket is reported separately and never affects flagging.
+    """
     page_idx_raw = page.get("page_idx")
     page_idx = page_idx_raw if isinstance(page_idx_raw, int) else 0
 
-    head_blocks, head_spans = _accumulate_blocks(_select_headline_blocks(page), threshold)
-    disc_blocks, disc_spans = _accumulate_blocks(page.get("discarded_blocks"), threshold)
+    headline = _as_block_list(_select_headline_blocks(page))
+    discarded = _as_block_list(page.get("discarded_blocks"))
+
+    if merge_discarded:
+        head_blocks, head_spans = _accumulate_blocks(headline + discarded, threshold)
+        disc_blocks, disc_spans = _Stats(), _Stats()
+    else:
+        head_blocks, head_spans = _accumulate_blocks(headline, threshold)
+        disc_blocks, disc_spans = _accumulate_blocks(discarded, threshold)
 
     flagged = (head_blocks.mean is not None and head_blocks.mean < threshold) or (
         head_spans.mean is not None and head_spans.mean < threshold
@@ -323,6 +342,7 @@ def _min_or_none(values: list[float]) -> float | None:
 def extract_confidence(
     middle_json: dict,
     low_confidence_threshold: float = DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+    merge_discarded: bool = False,
 ) -> DocumentConfidence:
     """Aggregate a MinerU pipeline ``_middle.json`` into a DocumentConfidence.
 
@@ -338,6 +358,12 @@ def extract_confidence(
         low_confidence_threshold: Shared threshold below which a block or span
             score counts as low confidence; defaults to
             :data:`DEFAULT_LOW_CONFIDENCE_THRESHOLD`.
+        merge_discarded: When ``True``, fold each page's ``discarded_blocks``
+            (the headers/footers/page-numbers/asides/footnotes MinerU filters
+            out) into the headline aggregates so they count toward the page and
+            document scores; the ``discarded_*`` fields then report empty. When
+            ``False`` (default), the discarded bucket is reported separately and
+            excluded from the headline scores and from flagging.
 
     Returns:
         A validated :class:`DocumentConfidence`.
@@ -359,7 +385,9 @@ def extract_confidence(
             if isinstance(pdf_info, list):
                 for page in pdf_info:
                     if isinstance(page, dict):
-                        pages.append(_build_page_confidence(page, low_confidence_threshold))
+                        pages.append(
+                            _build_page_confidence(page, low_confidence_threshold, merge_discarded)
+                        )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[confidence] failed to aggregate middle_json: {}", exc)
         pages = []
@@ -388,6 +416,7 @@ def extract_confidence(
 def extract_confidence_from_path(
     path: str | Path,
     low_confidence_threshold: float = DEFAULT_LOW_CONFIDENCE_THRESHOLD,
+    merge_discarded: bool = False,
 ) -> DocumentConfidence:
     """Read a ``_middle.json`` file and delegate to :func:`extract_confidence`.
 
@@ -398,6 +427,7 @@ def extract_confidence_from_path(
     Args:
         path: Filesystem path to a ``_middle.json`` dump.
         low_confidence_threshold: Passed through to :func:`extract_confidence`.
+        merge_discarded: Passed through to :func:`extract_confidence`.
 
     Returns:
         A validated :class:`DocumentConfidence`.
@@ -409,4 +439,4 @@ def extract_confidence_from_path(
             middle_json = data
     except Exception as exc:  # noqa: BLE001
         logger.debug("[confidence] failed to read middle_json {}: {}", path, exc)
-    return extract_confidence(middle_json, low_confidence_threshold)
+    return extract_confidence(middle_json, low_confidence_threshold, merge_discarded)
