@@ -82,6 +82,41 @@ _DOCLING_LABEL_MAP: Final[dict[str, ElementType]] = {
 
 _DOCLING_EXTENSIONS: Final[frozenset[str]] = frozenset({".docx", ".doc", ".html", ".htm", ".xhtml"})
 
+# NOTE: Maps PaddleOCR PP-StructureV3 ``block_label`` strings to internal
+# ElementType. Verified labels emitted by PP-DocLayout (the layout model behind
+# PP-StructureV3); any label not present falls through to ElementType.unknown.
+_PADDLE_LABEL_MAP: Final[dict[str, ElementType]] = {
+    "text": ElementType.text,
+    "abstract": ElementType.text,
+    "content": ElementType.text,
+    "reference": ElementType.text,
+    "aside_text": ElementType.text,
+    "algorithm": ElementType.text,
+    "doc_title": ElementType.heading,
+    "paragraph_title": ElementType.heading,
+    "title": ElementType.heading,
+    "table": ElementType.table,
+    "table_title": ElementType.caption,
+    "figure_title": ElementType.caption,
+    "chart_title": ElementType.caption,
+    "table_caption": ElementType.caption,
+    "figure_caption": ElementType.caption,
+    "image": ElementType.image,
+    "figure": ElementType.image,
+    "chart": ElementType.image,
+    "seal": ElementType.image,
+    "formula": ElementType.equation,
+    "formula_number": ElementType.equation,
+    "header": ElementType.header,
+    "header_image": ElementType.header,
+    "footer": ElementType.footer,
+    "footer_image": ElementType.footer,
+    "footnote": ElementType.footer,
+    "vision_footnote": ElementType.footer,
+    "number": ElementType.page_number,
+    "page_number": ElementType.page_number,
+}
+
 # NOTE: pypdfium2's underlying libpdfium C library is not thread-safe.
 # All calls that open or iterate PDF documents must be serialized with this lock
 # to prevent segfaults when parse_batch() runs multiple parses concurrently.
@@ -91,6 +126,11 @@ _PDFIUM_LOCK: threading.Lock = threading.Lock()
 # Populated lazily on first use; shared across all parse() calls in the process.
 _DOCLING_CONVERTER_CACHE: dict[tuple, Any] = {}
 _DOCLING_CONVERTER_CACHE_LOCK: threading.Lock = threading.Lock()
+
+# Module-level PP-StructureV3 pipeline, built lazily on first PaddleOCR parse and
+# shared across all parse() calls (model load is expensive; reuse the instance).
+_PADDLE_PIPELINE: Any = None
+_PADDLE_PIPELINE_LOCK: threading.Lock = threading.Lock()
 
 # Default chunk size for MinerU batch inference when MINERU_BATCH_SIZE is unset
 # or non-parseable. Must remain finite/bounded (never 0, negative, or unbounded).
@@ -115,6 +155,8 @@ _BATCH_FAILURE_CODES: Final[frozenset[str]] = frozenset(
         "mineru_error",
         "docling_failed",
         "docling_error",
+        "paddleocr_failed",
+        "paddleocr_error",
         "file_not_found",
         "unsupported_type",
     }
@@ -1020,6 +1062,165 @@ def _run_docling(file_path: Path, config: EnrichmentConfig) -> list[ElementRecor
     return elements
 
 
+def _get_paddle_pipeline() -> Any:
+    """Return the process-wide cached PaddleOCR-VL pipeline, building it lazily.
+
+    Uses PaddleOCR's ``PaddleOCRVL`` pipeline — the end-to-end PaddleOCR-VL-0.9B
+    vision-language model (NaViT visual encoder + ERNIE-4.5-0.3B decoder) — not
+    the older modular PP-StructureV3. The pipeline version defaults to ``v1.6``
+    (override via ``PADDLE_VL_VERSION``). The VL weights (~1.8 GB) download to the
+    PaddleX/HF cache on first use, then load on the GPU; the instance is built
+    once and reused across all PaddleOCR parses in the process.
+
+    Raises:
+        ImportError: When paddleocr / paddlex[ocr] are not installed.
+    """
+    global _PADDLE_PIPELINE
+    if _PADDLE_PIPELINE is not None:
+        return _PADDLE_PIPELINE
+    with _PADDLE_PIPELINE_LOCK:
+        if _PADDLE_PIPELINE is None:
+            try:
+                from paddleocr import PaddleOCRVL  # noqa: PLC0415
+            except ImportError as exc:
+                raise ImportError(
+                    "PaddleOCR is not installed. Run: uv pip install paddleocr "
+                    "'paddlex[ocr]' and paddlepaddle-gpu"
+                ) from exc
+            version = os.environ.get("PADDLE_VL_VERSION", "v1.6")
+            # Optional fast path: route the VL recognition step to an external
+            # OpenAI-compatible serving engine (vLLM/SGLang) instead of the slow
+            # in-process ``native`` generator. Set PADDLE_VL_BACKEND (e.g.
+            # ``vllm-server``) and PADDLE_VL_SERVER_URL (e.g.
+            # ``http://127.0.0.1:8118/v1``). When unset, the native backend runs.
+            kwargs: dict[str, Any] = {"pipeline_version": version}
+            vl_backend = os.environ.get("PADDLE_VL_BACKEND")
+            vl_server_url = os.environ.get("PADDLE_VL_SERVER_URL")
+            if vl_backend:
+                kwargs["vl_rec_backend"] = vl_backend
+            if vl_server_url:
+                kwargs["vl_rec_server_url"] = vl_server_url
+            _PADDLE_PIPELINE = PaddleOCRVL(**kwargs)
+        return _PADDLE_PIPELINE
+
+
+def _paddle_bbox_to_permille(
+    bbox: object, width: float | None, height: float | None
+) -> list[float]:
+    """Convert a PP-StructureV3 pixel ``[x0, y0, x1, y1]`` box to per-mille.
+
+    PP-StructureV3 reports boxes in pixels relative to the rendered page image
+    (``res["width"]`` × ``res["height"]``). We normalise to per-mille (0..1000,
+    top-left origin) so the stored ``ElementRecord.bbox`` matches MinerU's
+    convention exactly and the viewer needs no page-size context (see
+    ``viz/coords.py``). Returns ``[]`` (no geometry) on any unusable input.
+    """
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return []
+    if not width or not height:
+        return []
+    try:
+        x0, y0, x1, y1 = (float(v) for v in bbox)
+    except (TypeError, ValueError):
+        return []
+    return [
+        x0 * 1000.0 / width,
+        y0 * 1000.0 / height,
+        x1 * 1000.0 / width,
+        y1 * 1000.0 / height,
+    ]
+
+
+def _run_paddleocr(file_path: Path, config: EnrichmentConfig) -> list[ElementRecord]:
+    """Invoke the PaddleOCR-VL pipeline and return pre-routed ElementRecords.
+
+    PaddleOCR-VL (the 0.9B VLM) produces one result object per page; like every
+    PaddleX pipeline it carries a ``parsing_res_list`` of layout blocks
+    (``block_label``, ``block_content``, pixel ``block_bbox``) plus the page image
+    ``width``/``height``. Each block is mapped to an ElementType via
+    ``_PADDLE_LABEL_MAP`` and its box normalised to per-mille top-left (MinerU's
+    convention) so the rest of the pipeline and the viewer treat PaddleOCR exactly
+    like MinerU.
+
+    Args:
+        file_path: Path to the document to parse (PDF or image).
+        config: EnrichmentConfig (PaddleOCR has no extra pipeline controls yet).
+
+    Returns:
+        ElementRecord list in page / reading order.
+
+    Raises:
+        ImportError: When PaddleOCR is not installed.
+        RuntimeError: When the PaddleOCR-VL prediction raises.
+    """
+    pipeline = _get_paddle_pipeline()
+
+    # Optional predict-time tuning. ``PADDLE_VL_MERGE_BBOXES`` ("small"/"large")
+    # controls layout box merging: "small" measurably reduces detected-but-
+    # unrecognised text boxes on dense/scanned pages without dropping content
+    # (verified on a scanned form: blank text boxes 9 -> 3, char count kept),
+    # whereas "large" and doc-unwarping over-merge and lose text, so neither is
+    # enabled by default. Unset leaves the pipeline default.
+    predict_kwargs: dict[str, Any] = {"input": str(file_path)}
+    merge_mode = os.environ.get("PADDLE_VL_MERGE_BBOXES")
+    if merge_mode:
+        predict_kwargs["layout_merge_bboxes_mode"] = merge_mode
+
+    try:
+        results = list(pipeline.predict(**predict_kwargs))
+    except Exception as exc:
+        raise RuntimeError(f"PaddleOCR-VL predict failed: {exc}") from exc
+
+    sha256 = _file_sha256(file_path)
+    elements: list[ElementRecord] = []
+    element_idx = 0
+
+    for page_pos, res in enumerate(results):
+        data = getattr(res, "json", None)
+        if not isinstance(data, dict):
+            continue
+        inner = data.get("res", data)
+        if not isinstance(inner, dict):
+            continue
+
+        # page_index is the absolute 0-based page; fall back to enumeration order.
+        page_idx = inner.get("page_index")
+        page_idx = int(page_idx) if isinstance(page_idx, (int, float)) else page_pos
+
+        width = inner.get("width")
+        height = inner.get("height")
+
+        # parsing_res_list is the reading-order layout result; block_order is
+        # already 1-based reading order, so we keep PP-StructureV3's order.
+        blocks = inner.get("parsing_res_list") or []
+        for blk in blocks:
+            if not isinstance(blk, dict):
+                element_idx += 1
+                continue
+            label = str(blk.get("block_label", "") or "").lower()
+            etype = _PADDLE_LABEL_MAP.get(label, ElementType.unknown)
+            content = blk.get("block_content", "")
+            text = content if isinstance(content, str) else str(content or "")
+            bbox_pm = _paddle_bbox_to_permille(blk.get("block_bbox"), width, height)
+            try:
+                elements.append(
+                    ElementRecord(
+                        element_id=_build_element_id(sha256, page_idx, element_idx),
+                        type=etype,
+                        text=text.strip(),
+                        bbox=bbox_pm,
+                        page_idx=page_idx,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — per-block routing is non-fatal
+                logger.debug(
+                    "[paddleocr] skipping block label={} idx={}: {}", label, element_idx, exc
+                )
+            element_idx += 1
+
+    return elements
+
+
 def _accepted_extensions(config: EnrichmentConfig) -> frozenset[str]:
     """Return the set of accepted file extensions for the given parser config.
 
@@ -1445,7 +1646,9 @@ def _build_parser_output(
         # NOTE: Last-resort net for this helper — never propagate. Carries a
         # backend-specific error code so callers stay consistent with parse().
         logger.warning("[parser] _build_parser_output failed for {}: {}", file_path, exc)
-        error_code = "docling_error" if config.parser == "docling" else "mineru_error"
+        error_code = {"docling": "docling_error", "paddleocr": "paddleocr_error"}.get(
+            config.parser, "mineru_error"
+        )
         return ParserOutput(
             file_path=str(file_path),
             file_sha256=sha256,
@@ -1721,6 +1924,28 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
                     enrichment_config=config,
                 )
             content_list = []
+        elif config.parser == "paddleocr":
+            # NOTE: dedicated engine try/except — preserves the specific
+            # ``paddleocr_failed`` code; not collapsed into the outer net.
+            try:
+                all_elements = _run_paddleocr(file_path, config)
+            except Exception as exc:
+                logger.warning("[parser] PaddleOCR failed for {}: {}", file_path, exc)
+                return ParserOutput(
+                    file_path=str(file_path),
+                    file_sha256=sha256,
+                    page_count=0,
+                    pages=[],
+                    elements=[],
+                    warnings=[
+                        WarningRecord(
+                            code="paddleocr_failed",
+                            message=f"PaddleOCR failed: {exc}",
+                        )
+                    ],
+                    enrichment_config=config,
+                )
+            content_list = []
         else:
             # NOTE: dedicated engine try/except — preserves the specific
             # ``mineru_failed`` code; not collapsed into the outer net.
@@ -1758,7 +1983,9 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
             sha = _file_sha256(file_path) if file_path.exists() else ""
         except Exception:  # noqa: BLE001
             sha = ""
-        error_code = "docling_error" if config.parser == "docling" else "mineru_error"
+        error_code = {"docling": "docling_error", "paddleocr": "paddleocr_error"}.get(
+            config.parser, "mineru_error"
+        )
         return ParserOutput(
             file_path=str(file_path),
             file_sha256=sha,

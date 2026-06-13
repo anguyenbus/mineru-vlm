@@ -72,6 +72,10 @@ _MIN_EXTENT: Final[float] = 1e-4
 COORD: Final[dict[str, dict[str, str]]] = {
     # MinerU content_list.json: per-mille (0..1000), top-left. ÷1000, no flip.
     "mineru": {"origin": "topleft", "unit": "permille"},
+    # PaddleOCR PP-StructureV3 returns pixel boxes; the backend pre-normalises
+    # them to per-mille (0..1000) top-left at parse time (see _run_paddleocr),
+    # so the viewer treats it exactly like MinerU: ÷1000, no flip, no page size.
+    "paddleocr": {"origin": "topleft", "unit": "permille"},
     # Docling prov bbox stored [l, b, r, t]: PDF points, bottom-left. ÷points,
     # flip Y.
     "docling": {"origin": "bottomleft", "unit": "points"},

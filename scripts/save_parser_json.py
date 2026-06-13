@@ -24,6 +24,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("src", help="source document path")
     ap.add_argument("--mineru-out", default="m.json")
     ap.add_argument("--docling-out", default="d.json")
+    ap.add_argument(
+        "--paddleocr-out",
+        default=None,
+        help="if set, also parse with PaddleOCR-VL and write here",
+    )
     args = ap.parse_args(argv)
 
     src = Path(args.src)
@@ -50,6 +55,16 @@ def main(argv: list[str] | None = None) -> int:
         f"(pages={docling_out.page_count}, elements={len(docling_out.elements)}, "
         f"warnings={[w.code for w in docling_out.warnings]})"
     )
+
+    if args.paddleocr_out:
+        print(f"[save_parser_json] parsing {src} with PaddleOCR-VL ...")
+        paddle_out = parse(src, EnrichmentConfig(parser="paddleocr"))
+        Path(args.paddleocr_out).write_text(paddle_out.model_dump_json())
+        print(
+            f"[save_parser_json]   -> {args.paddleocr_out} "
+            f"(pages={paddle_out.page_count}, elements={len(paddle_out.elements)}, "
+            f"warnings={[w.code for w in paddle_out.warnings]})"
+        )
     return 0
 
 

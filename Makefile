@@ -66,8 +66,8 @@ ifeq ($(REPORT_SRC),)
 	@echo "usage: make report <file.pdf>   (or: make report SRC=<file.pdf>)"; exit 2
 endif
 	mkdir -p "$(REPORT_DIR)"
-	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --mineru-out "$(REPORT_DIR)/m.json" --docling-out "$(REPORT_DIR)/d.json"
-	$(PYTHON) scripts/parse_report.py "$(REPORT_SRC)" --mineru "$(REPORT_DIR)/m.json" --docling "$(REPORT_DIR)/d.json" -o "$(REPORT_OUT)"
+	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --mineru-out "$(REPORT_DIR)/m.json" --docling-out "$(REPORT_DIR)/d.json" --paddleocr-out "$(REPORT_DIR)/p.json"
+	$(PYTHON) scripts/parse_report.py "$(REPORT_SRC)" --mineru "$(REPORT_DIR)/m.json" --docling "$(REPORT_DIR)/d.json" --paddleocr "$(REPORT_DIR)/p.json" -o "$(REPORT_OUT)"
 	@echo "Open $(REPORT_OUT) in your browser (or VS Code) to review."
 
 report-clean:
