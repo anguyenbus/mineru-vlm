@@ -117,6 +117,44 @@ _PADDLE_LABEL_MAP: Final[dict[str, ElementType]] = {
     "page_number": ElementType.page_number,
 }
 
+# NOTE: Maps MinerU2.5-Pro VLM ``ContentBlock.type`` strings (defined in
+# mineru_vl_utils.structs.BlockType) to internal ElementType. The MinerU2.5-Pro
+# model emits a richer layout vocabulary than the pipeline content_list, so this
+# is kept separate from _BLOCK_TYPE_MAP. The container types (list / image_block
+# / equation_block) are mapped too: two_step_extract emits the container as a
+# content-bearing block in its own right (observed: pages with ``list`` blocks
+# and no separate ``list_item`` children), so mapping them keeps that content
+# correctly labelled rather than dropping it to ``unknown``. Any type not present
+# falls through to ElementType.unknown.
+_MINERU25PRO_LABEL_MAP: Final[dict[str, ElementType]] = {
+    "text": ElementType.text,
+    "aside_text": ElementType.text,
+    "ref_text": ElementType.text,
+    "index": ElementType.text,
+    "phonetic": ElementType.text,
+    "algorithm": ElementType.text,
+    "code": ElementType.text,
+    "title": ElementType.heading,
+    "table": ElementType.table,
+    "equation": ElementType.equation,
+    "equation_block": ElementType.equation,
+    "formula_number": ElementType.equation,
+    "list": ElementType.list_item,
+    "list_item": ElementType.list_item,
+    "table_caption": ElementType.caption,
+    "image_caption": ElementType.caption,
+    "code_caption": ElementType.caption,
+    "table_footnote": ElementType.caption,
+    "image_footnote": ElementType.caption,
+    "header": ElementType.header,
+    "footer": ElementType.footer,
+    "page_footnote": ElementType.footer,
+    "page_number": ElementType.page_number,
+    "image": ElementType.image,
+    "image_block": ElementType.image,
+    "chart": ElementType.image,
+}
+
 # NOTE: pypdfium2's underlying libpdfium C library is not thread-safe.
 # All calls that open or iterate PDF documents must be serialized with this lock
 # to prevent segfaults when parse_batch() runs multiple parses concurrently.
@@ -131,6 +169,16 @@ _DOCLING_CONVERTER_CACHE_LOCK: threading.Lock = threading.Lock()
 # shared across all parse() calls (model load is expensive; reuse the instance).
 _PADDLE_PIPELINE: Any = None
 _PADDLE_PIPELINE_LOCK: threading.Lock = threading.Lock()
+
+# Module-level MinerU2.5-Pro vLLM client, built lazily on first mineru25pro parse
+# and shared across all parse() calls. The vLLM engine loads the model onto the
+# GPU once (~2.5 GB weights) and holds it; rebuilding per call would be ruinous.
+_MINERU25PRO_CLIENT: Any = None
+_MINERU25PRO_CLIENT_LOCK: threading.Lock = threading.Lock()
+
+# Default HuggingFace model id for the MinerU2.5-Pro VLM backend. Override with
+# the MINERU25PRO_MODEL env var (e.g. to pin a different snapshot or local path).
+_DEFAULT_MINERU25PRO_MODEL: Final[str] = "opendatalab/MinerU2.5-Pro-2604-1.2B"
 
 # Default chunk size for MinerU batch inference when MINERU_BATCH_SIZE is unset
 # or non-parseable. Must remain finite/bounded (never 0, negative, or unbounded).
@@ -157,6 +205,8 @@ _BATCH_FAILURE_CODES: Final[frozenset[str]] = frozenset(
         "docling_error",
         "paddleocr_failed",
         "paddleocr_error",
+        "mineru25pro_failed",
+        "mineru25pro_error",
         "file_not_found",
         "unsupported_type",
     }
@@ -1221,6 +1271,154 @@ def _run_paddleocr(file_path: Path, config: EnrichmentConfig) -> list[ElementRec
     return elements
 
 
+def _get_mineru25pro_client() -> Any:
+    """Return the process-wide cached MinerU2.5-Pro vLLM client, building it lazily.
+
+    Loads ``opendatalab/MinerU2.5-Pro-2604-1.2B`` (override via
+    ``MINERU25PRO_MODEL``) into an in-process vLLM engine and wraps it in a
+    ``MinerUClient`` (``backend="vllm-engine"``). The ~2.5 GB weights download to
+    the HF cache on first use, then load on the GPU; the client is built once and
+    reused across all mineru25pro parses in the process. vLLM tuning is exposed
+    via env: ``MINERU25PRO_GPU_MEM_UTIL`` (default 0.5, leaving room for the
+    MinerU pipeline / PaddleOCR models that may share the device) and
+    ``MINERU25PRO_MAX_MODEL_LEN`` (optional vLLM ``max_model_len`` cap).
+
+    Raises:
+        ImportError: When vllm / mineru-vl-utils are not installed.
+    """
+    global _MINERU25PRO_CLIENT
+    if _MINERU25PRO_CLIENT is not None:
+        return _MINERU25PRO_CLIENT
+    with _MINERU25PRO_CLIENT_LOCK:
+        if _MINERU25PRO_CLIENT is None:
+            try:
+                from mineru_vl_utils import MinerUClient  # noqa: PLC0415
+                from vllm import LLM  # noqa: PLC0415
+            except ImportError as exc:
+                raise ImportError(
+                    "MinerU2.5-Pro deps are not installed. Run: "
+                    "uv pip install vllm 'mineru-vl-utils[vllm]'"
+                ) from exc
+            model = os.environ.get("MINERU25PRO_MODEL", _DEFAULT_MINERU25PRO_MODEL)
+            llm_kwargs: dict[str, Any] = {
+                "model": model,
+                "gpu_memory_utilization": float(
+                    os.environ.get("MINERU25PRO_GPU_MEM_UTIL", "0.5")
+                ),
+            }
+            max_len = os.environ.get("MINERU25PRO_MAX_MODEL_LEN")
+            if max_len:
+                llm_kwargs["max_model_len"] = int(max_len)
+            llm = LLM(**llm_kwargs)
+            _MINERU25PRO_CLIENT = MinerUClient(backend="vllm-engine", vllm_llm=llm)
+        return _MINERU25PRO_CLIENT
+
+
+def _render_pages_for_vlm(file_path: Path) -> list[Any]:
+    """Rasterise a document to a list of RGB PIL images (one per page).
+
+    MinerU2.5-Pro consumes page images, so PDFs are rendered via pypdfium2 (the
+    libpdfium calls are serialised on ``_PDFIUM_LOCK`` — the C library is not
+    thread-safe) and image inputs are loaded directly. The render scale honours
+    ``PARSER_RENDER_DPI`` (default 144). Returns ``[]`` on any failure so the
+    caller degrades to an empty parse rather than crashing.
+    """
+    from PIL import Image  # noqa: PLC0415
+
+    suffix = file_path.suffix.lower()
+    if suffix != ".pdf":
+        try:
+            return [Image.open(file_path).convert("RGB")]
+        except Exception as exc:  # noqa: BLE001 — unreadable image degrades to empty
+            logger.warning("[mineru25pro] could not open image {}: {}", file_path, exc)
+            return []
+
+    import pypdfium2 as pdfium  # noqa: PLC0415
+
+    dpi = float(os.environ.get("PARSER_RENDER_DPI", "144"))
+    scale = dpi / 72.0
+    images: list[Any] = []
+    with _PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(str(file_path))
+        try:
+            for page in pdf:
+                bitmap = page.render(scale=scale)
+                images.append(bitmap.to_pil().convert("RGB"))
+                bitmap.close()
+                page.close()
+        finally:
+            pdf.close()
+    return images
+
+
+def _run_mineru25pro(file_path: Path, config: EnrichmentConfig) -> list[ElementRecord]:
+    """Invoke the MinerU2.5-Pro VLM and return pre-routed ElementRecords.
+
+    Renders each page to an image and runs ``MinerUClient.batch_two_step_extract``
+    (layout detection + per-block recognition). Each returned ``ContentBlock``
+    carries a ``type``, a ``bbox`` normalised to ``[0, 1]`` (top-left origin) and
+    ``content`` (recognised text / HTML table / LaTeX). The box is scaled to
+    per-mille (0..1000) so the stored ``ElementRecord.bbox`` matches MinerU's
+    convention exactly and the viewer needs no page-size context (see
+    ``viz/coords.py``); the type is mapped via ``_MINERU25PRO_LABEL_MAP``.
+
+    Args:
+        file_path: Path to the document to parse (PDF or image).
+        config: EnrichmentConfig (MinerU2.5-Pro has no extra pipeline controls).
+
+    Returns:
+        ElementRecord list in page / reading order.
+
+    Raises:
+        ImportError: When vllm / mineru-vl-utils are not installed.
+        RuntimeError: When the VLM extraction raises.
+    """
+    images = _render_pages_for_vlm(file_path)
+    if not images:
+        return []
+
+    client = _get_mineru25pro_client()
+    try:
+        per_page_blocks = client.batch_two_step_extract(images)
+    except Exception as exc:
+        raise RuntimeError(f"MinerU2.5-Pro extract failed: {exc}") from exc
+
+    sha256 = _file_sha256(file_path)
+    elements: list[ElementRecord] = []
+    element_idx = 0
+
+    for page_idx, blocks in enumerate(per_page_blocks):
+        for blk in blocks or []:
+            label = str(getattr(blk, "type", "") or "").lower()
+            etype = _MINERU25PRO_LABEL_MAP.get(label, ElementType.unknown)
+            content = getattr(blk, "content", "") or ""
+            text = content if isinstance(content, str) else str(content)
+            bbox = getattr(blk, "bbox", None)
+            bbox_pm: list[float] = []
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                try:
+                    bbox_pm = [float(v) * 1000.0 for v in bbox]
+                except (TypeError, ValueError):
+                    bbox_pm = []
+            try:
+                elements.append(
+                    ElementRecord(
+                        element_id=_build_element_id(sha256, page_idx, element_idx),
+                        type=etype,
+                        text=text.strip(),
+                        bbox=bbox_pm,
+                        page_idx=page_idx,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — per-block routing is non-fatal
+                logger.debug(
+                    "[mineru25pro] skipping block type={} idx={}: {}", label, element_idx, exc
+                )
+            element_idx += 1
+
+    return elements
+
+
 def _accepted_extensions(config: EnrichmentConfig) -> frozenset[str]:
     """Return the set of accepted file extensions for the given parser config.
 
@@ -1646,7 +1844,11 @@ def _build_parser_output(
         # NOTE: Last-resort net for this helper — never propagate. Carries a
         # backend-specific error code so callers stay consistent with parse().
         logger.warning("[parser] _build_parser_output failed for {}: {}", file_path, exc)
-        error_code = {"docling": "docling_error", "paddleocr": "paddleocr_error"}.get(
+        error_code = {
+            "docling": "docling_error",
+            "paddleocr": "paddleocr_error",
+            "mineru25pro": "mineru25pro_error",
+        }.get(
             config.parser, "mineru_error"
         )
         return ParserOutput(
@@ -1946,6 +2148,28 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
                     enrichment_config=config,
                 )
             content_list = []
+        elif config.parser == "mineru25pro":
+            # NOTE: dedicated engine try/except — preserves the specific
+            # ``mineru25pro_failed`` code; not collapsed into the outer net.
+            try:
+                all_elements = _run_mineru25pro(file_path, config)
+            except Exception as exc:
+                logger.warning("[parser] MinerU2.5-Pro failed for {}: {}", file_path, exc)
+                return ParserOutput(
+                    file_path=str(file_path),
+                    file_sha256=sha256,
+                    page_count=0,
+                    pages=[],
+                    elements=[],
+                    warnings=[
+                        WarningRecord(
+                            code="mineru25pro_failed",
+                            message=f"MinerU2.5-Pro failed: {exc}",
+                        )
+                    ],
+                    enrichment_config=config,
+                )
+            content_list = []
         else:
             # NOTE: dedicated engine try/except — preserves the specific
             # ``mineru_failed`` code; not collapsed into the outer net.
@@ -1983,7 +2207,11 @@ def parse(file_path: Path, config: EnrichmentConfig | None = None) -> ParserOutp
             sha = _file_sha256(file_path) if file_path.exists() else ""
         except Exception:  # noqa: BLE001
             sha = ""
-        error_code = {"docling": "docling_error", "paddleocr": "paddleocr_error"}.get(
+        error_code = {
+            "docling": "docling_error",
+            "paddleocr": "paddleocr_error",
+            "mineru25pro": "mineru25pro_error",
+        }.get(
             config.parser, "mineru_error"
         )
         return ParserOutput(

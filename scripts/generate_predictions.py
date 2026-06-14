@@ -14,10 +14,13 @@ Usage:
 import json
 import os
 import sys
+import argparse
 from pathlib import Path
 
-# Force CPU-only MinerU on machines without a compatible GPU.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# NOTE: We no longer force CPU here — the benchmark runs each backend on the GPU
+# (MinerU pipeline, MinerU2.5-Pro vLLM) when one is present. To force CPU (e.g.
+# for Docling or a GPU-less host) set CUDA_VISIBLE_DEVICES="" in the environment
+# before invoking this script; it is respected as-is.
 
 # Resolve project root so this script can be run from any working directory.
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -26,6 +29,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 import doc_bench as _doc_bench_pkg  # noqa: E402  (after sys.path mutation)
 
 from hybrid_doc_parser import ElementType, ParserOutput, parse  # noqa: E402
+from hybrid_doc_parser.models import EnrichmentConfig  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,6 +39,10 @@ FIXTURES_DIR: Path = Path(_doc_bench_pkg.__file__).parent / "fixtures"
 PREDICTIONS_DIR: Path = PROJECT_ROOT / "predictions"
 BENCHMARK_DIR: Path = PROJECT_ROOT / "benchmark"
 PARSER_VERSION = "0.1.0"
+
+# Backend used for every parse() call in this run. Set from --parser in main();
+# defaults to the library default (MinerU pipeline).
+PARSER_CONFIG: EnrichmentConfig = EnrichmentConfig()
 
 # Map our ElementType values to doc_bench element types.
 _TYPE_MAP: dict[ElementType, str] = {
@@ -284,8 +292,8 @@ def process_file(
     mime_type: str = "application/pdf",
 ) -> None:
     """Parse one PDF or image, convert to doc_bench schema, write predictions/<doc_id>.json."""
-    print(f"  Parsing {source_path.name} ...")
-    output = parse(source_path)
+    print(f"  Parsing {source_path.name} (parser={PARSER_CONFIG.parser}) ...")
+    output = parse(source_path, PARSER_CONFIG)
 
     n_warnings = len(output.warnings)
     n_elements = len(output.elements)
@@ -336,7 +344,29 @@ def setup_omnidocbench_dir() -> Path:
 
 def main() -> None:
     """Entry point: set up benchmark layout and generate all predictions."""
-    PREDICTIONS_DIR.mkdir(exist_ok=True)
+    global PARSER_CONFIG, PREDICTIONS_DIR
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--parser",
+        choices=["mineru", "docling", "paddleocr", "mineru25pro"],
+        default="mineru",
+        help="parsing backend to benchmark (default: mineru)",
+    )
+    ap.add_argument(
+        "--predictions-dir",
+        type=Path,
+        default=None,
+        help="output directory for <doc_id>.json predictions (default: ./predictions)",
+    )
+    args = ap.parse_args()
+
+    PARSER_CONFIG = EnrichmentConfig(parser=args.parser)
+    if args.predictions_dir is not None:
+        PREDICTIONS_DIR = args.predictions_dir
+    print(f"[generate_predictions] backend={args.parser}  predictions_dir={PREDICTIONS_DIR}")
+
+    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     # --- Set up dp_bench benchmark directory --------------------------------
     print("[setup] Building dp_bench benchmark directory ...")

@@ -76,6 +76,10 @@ COORD: Final[dict[str, dict[str, str]]] = {
     # them to per-mille (0..1000) top-left at parse time (see _run_paddleocr),
     # so the viewer treats it exactly like MinerU: ÷1000, no flip, no page size.
     "paddleocr": {"origin": "topleft", "unit": "permille"},
+    # MinerU2.5-Pro VLM returns bbox normalised to [0,1] top-left; the backend
+    # scales it to per-mille (0..1000) at parse time (see _run_mineru25pro), so
+    # the viewer treats it exactly like MinerU: ÷1000, no flip, no page size.
+    "mineru25pro": {"origin": "topleft", "unit": "permille"},
     # Docling prov bbox stored [l, b, r, t]: PDF points, bottom-left. ÷points,
     # flip Y.
     "docling": {"origin": "bottomleft", "unit": "points"},

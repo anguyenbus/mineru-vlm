@@ -94,9 +94,9 @@ def doc_from_parser_output(
 
     for el in parser_output.elements:
         page = el.page_idx
-        if backend in ("mineru", "paddleocr"):
-            # Per-mille is page-relative; page size is not needed. PaddleOCR's
-            # backend pre-normalises its pixel boxes to per-mille at parse time.
+        if backend in ("mineru", "paddleocr", "mineru25pro"):
+            # Per-mille is page-relative; page size is not needed. PaddleOCR and
+            # MinerU2.5-Pro pre-normalise their boxes to per-mille at parse time.
             canon = to_canonical(el.bbox, backend)
         else:
             w, h = _page_size(sizes, page) or _FALLBACK_PAGE_PT

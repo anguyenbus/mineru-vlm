@@ -273,6 +273,9 @@ Cache writes are atomic and never raise. Set the location with
 | `MINERU_BATCH_SIZE` | `8` | Documents per `do_parse` inference pass in `parse_batch()`. Finite/bounded; bad or `<1` values fall back to 8. |
 | `MINERU_MAX_INFLIGHT` | `1` | Concurrent MinerU inference passes across all callers (raise for multi-GPU). |
 | `MINERU_DEVICE_MODE` | (MinerU default) | `cuda` / `cpu` device selection. |
+| `MINERU25PRO_MODEL` | `opendatalab/MinerU2.5-Pro-2604-1.2B` | HF model id / local path for the MinerU2.5-Pro VLM backend. |
+| `MINERU25PRO_GPU_MEM_UTIL` | `0.5` | vLLM `gpu_memory_utilization` for MinerU2.5-Pro (leaves VRAM for other models). |
+| `MINERU25PRO_MAX_MODEL_LEN` | (vLLM default) | Optional vLLM `max_model_len` cap for MinerU2.5-Pro. |
 | `CUDA_VISIBLE_DEVICES` | (unset) | Set to `""` to force CPU. |
 | `PARSER_RENDER_DPI` | `144` | DPI for page/region rasterization. |
 | `PARSER_MAX_RENDER_MP` | `40.0` | Max megapixels per rendered page. |
@@ -339,7 +342,11 @@ Path("d.json").write_text(
 python scripts/parse_report.py source.pdf --mineru m.json --docling d.json -o report.html
 ```
 
-Both `--mineru` and `--docling` are **optional** — one backend plus the pdfplumber baseline
+`make report file.pdf` automates the full three-backend comparison (MinerU vs Docling vs
+MinerU2.5-Pro), running each parse in its own process so the GPU-resident models never
+co-load, then building the linked HTML report.
+
+All backend JSON flags are **optional** — one backend plus the pdfplumber baseline
 (always computed from the source PDF) is a valid report. The pdfplumber tab is produced
 automatically whenever pdfplumber is installed.
 
@@ -349,6 +356,8 @@ Flags:
 |---|---|---|
 | `--mineru PATH` | — | A saved `ParserOutput` JSON for the MinerU backend (optional). |
 | `--docling PATH` | — | A saved `ParserOutput` JSON for the Docling backend (optional). |
+| `--paddleocr PATH` | — | A saved `ParserOutput` JSON for the PaddleOCR-VL backend (optional). |
+| `--mineru25pro PATH` | — | A saved `ParserOutput` JSON for the MinerU2.5-Pro VLM backend (optional). |
 | `-o` / `--out PATH` | `./parse_reports/<source>.parse_report.html` | Output HTML file. |
 | `--dpi N` | `144` | Page render resolution (matches `PARSER_RENDER_DPI`). |
 | `--max-pages N` | `50` | Page cap before truncation; a **visible in-report note** appears when the document exceeds it (base64-embedding every page bloats the HTML). |
@@ -371,6 +380,7 @@ convention, locked in `viz/coords.py`:
 | Backend | Origin / unit | Transform to canonical 0–1 top-left |
 |---|---|---|
 | **MinerU** | top-left, **per-mille** (0–1000) | divide by 1000, **no Y-flip**; page size not needed |
+| **MinerU2.5-Pro** | top-left, **normalized [0,1]** (scaled to per-mille at parse time) | divide by 1000, **no Y-flip**; page size not needed |
 | **Docling** | bottom-left, PDF **points** | divide by page points, **flip Y** (`1 - y`) |
 | **pdfplumber** | top-left, PDF **points** | divide by page points |
 

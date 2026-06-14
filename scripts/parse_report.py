@@ -122,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mineru", help="ParserOutput JSON (mineru backend); optional")
     ap.add_argument("--docling", help="ParserOutput JSON (docling backend); optional")
     ap.add_argument("--paddleocr", help="ParserOutput JSON (paddleocr backend); optional")
+    ap.add_argument("--mineru25pro", help="ParserOutput JSON (MinerU2.5-Pro backend); optional")
     ap.add_argument("--dpi", type=int, default=144, help="render DPI (default 144)")
     ap.add_argument(
         "--max-pages",
@@ -178,6 +179,9 @@ def main(argv: list[str] | None = None) -> int:
     paddleocr_po = _load_parser_output(args.paddleocr, "paddleocr", notes)
     if paddleocr_po is not None:
         docs["paddleocr"] = doc_from_parser_output(paddleocr_po, "paddleocr", size_by_idx)
+    mineru25pro_po = _load_parser_output(args.mineru25pro, "mineru25pro", notes)
+    if mineru25pro_po is not None:
+        docs["mineru25pro"] = doc_from_parser_output(mineru25pro_po, "mineru25pro", size_by_idx)
     docs["pdfplumber"] = doc_from_pdfplumber(pdf_path)  # always-available baseline
 
     out.write_text(build_html(pages_b64, docs, pdf_path.name, notes=notes, page_indices=indices))

@@ -99,7 +99,7 @@ class EnrichmentConfig(BaseModel):
     context_window: int = Field(default=3, ge=0, le=20)
     max_context_tokens: int = Field(default=512, ge=64, le=4096)
     vlm_backend: Literal["openai_compatible", "bedrock"] = "openai_compatible"
-    parser: Literal["mineru", "docling", "paddleocr"] = "mineru"
+    parser: Literal["mineru", "docling", "paddleocr", "mineru25pro"] = "mineru"
 
     # NOTE: Docling-specific pipeline controls; ignored when parser="mineru"
     do_ocr: bool = True

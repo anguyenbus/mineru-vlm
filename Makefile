@@ -23,7 +23,7 @@ REPORT_OUT := $(REPORT_DIR)/$(REPORT_STEM).parse_report.html
 help:
 	@echo "Targets:"
 	@echo "  make parse file.pdf    - parse file.pdf (MinerU) -> <stem>.md, <stem>.json, <stem>.confidence.json"
-	@echo "  make report file.pdf   - parse file.pdf (MinerU + Docling) and build the linked HTML report"
+	@echo "  make report file.pdf   - parse file.pdf (MinerU + Docling + MinerU2.5-Pro) and build the linked HTML report"
 	@echo "  make viz-install       - install viz extra deps (pdfplumber, pillow, pypdfium2)"
 	@echo "  make test              - run the full test suite"
 	@echo "  make test-fast         - run tests excluding the 'slow' marker"
@@ -66,8 +66,13 @@ ifeq ($(REPORT_SRC),)
 	@echo "usage: make report <file.pdf>   (or: make report SRC=<file.pdf>)"; exit 2
 endif
 	mkdir -p "$(REPORT_DIR)"
-	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --mineru-out "$(REPORT_DIR)/m.json" --docling-out "$(REPORT_DIR)/d.json" --paddleocr-out "$(REPORT_DIR)/p.json"
-	$(PYTHON) scripts/parse_report.py "$(REPORT_SRC)" --mineru "$(REPORT_DIR)/m.json" --docling "$(REPORT_DIR)/d.json" --paddleocr "$(REPORT_DIR)/p.json" -o "$(REPORT_OUT)"
+	# One backend PER PROCESS (--only): GPU-resident backends (MinerU pipeline,
+	# PaddleOCR-VL, and the MinerU2.5-Pro vLLM engine) must not co-load and
+	# contend for VRAM on a single device. Each parse caches independently.
+	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only mineru     --mineru-out "$(REPORT_DIR)/m.json"
+	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only docling    --docling-out "$(REPORT_DIR)/d.json"
+	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only mineru25pro --mineru25pro-out "$(REPORT_DIR)/m25pro.json"
+	$(PYTHON) scripts/parse_report.py "$(REPORT_SRC)" --mineru "$(REPORT_DIR)/m.json" --docling "$(REPORT_DIR)/d.json" --mineru25pro "$(REPORT_DIR)/m25pro.json" -o "$(REPORT_OUT)"
 	@echo "Open $(REPORT_OUT) in your browser (or VS Code) to review."
 
 report-clean:
