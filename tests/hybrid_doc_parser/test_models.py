@@ -249,3 +249,25 @@ class TestWarningRecordNullPageIdx:
             message="render_region raised ValueError",
         )
         assert warning.page_idx == 3
+
+
+class TestEnrichmentConfigAutoParser:
+    """Test Group 1: EnrichmentConfig.parser accepts 'auto' as a valid Literal value."""
+
+    def test_auto_parser_constructs_without_error(self) -> None:
+        """EnrichmentConfig(parser='auto') must construct without a ValidationError.
+
+        The 'auto' value selects the backend per file at classify-time via
+        MinerU's classify() heuristic rather than statically.
+        """
+        cfg = EnrichmentConfig(parser="auto")
+        assert cfg.parser == "auto"
+
+    def test_invalid_parser_value_raises_validation_error(self) -> None:
+        """EnrichmentConfig(parser='invalid_value') must raise ValidationError.
+
+        This is a regression guard confirming the Literal is still constrained
+        to only the valid backend identifiers.
+        """
+        with pytest.raises(ValidationError):
+            EnrichmentConfig(parser="invalid_value")

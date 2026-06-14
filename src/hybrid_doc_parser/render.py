@@ -225,31 +225,24 @@ def text_layer_tokens(pdf_path: Path) -> dict[int, int]:
     Pages with no embedded text layer (scanned/image-only PDFs) return 0
     tokens per page rather than raising.
 
+    Uses pypdf (pure Python) rather than pypdfium2 so this function is
+    thread-safe and requires no external lock in parse_batch().
+
     Args:
         pdf_path: Path to the PDF file.
 
     Returns:
         Mapping from zero-based page index to whitespace-split token count.
-        Returns ``{}`` on any error (missing file, corrupt PDF, or if pypdfium2
-        is not installed).
+        Returns ``{}`` on any error (missing file, corrupt PDF).
     """
     try:
-        import pypdfium2  # noqa: PLC0415
+        from pypdf import PdfReader  # noqa: PLC0415
 
-        pdf = None
-        try:
-            pdf = pypdfium2.PdfDocument(str(pdf_path))
-            counts: dict[int, int] = {}
-            for i in range(len(pdf)):
-                try:
-                    text = pdf[i].get_textpage().get_text_range()
-                except Exception:  # noqa: BLE001
-                    text = ""
-                counts[i] = len(text.split())
-            return counts
-        finally:
-            if pdf is not None:
-                pdf.close()
+        reader = PdfReader(str(pdf_path))
+        return {
+            i: len((page.extract_text() or "").split())
+            for i, page in enumerate(reader.pages)
+        }
     except Exception as exc:
         logger.debug("[render] text_layer_tokens failed for {}: {}", pdf_path, exc)
         return {}

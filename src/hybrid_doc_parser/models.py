@@ -74,7 +74,10 @@ class EnrichmentConfig(BaseModel):
             any OpenAI-protocol server, ``"bedrock"`` for AWS Bedrock.
         parser: Which document parsing backend to use; ``"mineru"`` for the
             MinerU pipeline (default), ``"docling"`` for Docling (supports
-            DOCX, HTML, and other non-PDF formats).
+            DOCX, HTML, and other non-PDF formats), or ``"auto"`` to select
+            the backend per file at classify-time via MinerU's ``classify()``
+            heuristic (scanned PDFs -> MinerU, text-layer PDFs -> Docling,
+            images -> MinerU, DOCX/HTML -> Docling).
         do_ocr: Enable OCR during Docling PDF processing; default ``True``.
         table_mode: Docling TableFormer mode; ``"fast"`` (default) or
             ``"accurate"`` for higher fidelity at the cost of latency.
@@ -94,7 +97,10 @@ class EnrichmentConfig(BaseModel):
     context_window: int = Field(default=3, ge=0, le=20)
     max_context_tokens: int = Field(default=512, ge=64, le=4096)
     vlm_backend: Literal["openai_compatible", "bedrock"] = "openai_compatible"
-    parser: Literal["mineru", "docling"] = "mineru"
+    # NOTE: "auto" selects the backend per file at classify-time via MinerU's
+    # classify() heuristic: "ocr" result -> "mineru", "txt" result -> "docling".
+    # Images fall back to MinerU; DOCX/HTML fall back to Docling.
+    parser: Literal["mineru", "docling", "auto"] = "mineru"
 
     # NOTE: Docling-specific pipeline controls; ignored when parser="mineru"
     do_ocr: bool = True

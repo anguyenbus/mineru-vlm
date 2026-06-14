@@ -5,6 +5,7 @@ description = "MinerU 3.xx + per-element VLM enrichment hybrid document parser"
 requires-python = ">=3.12"
 dependencies = [
     "pypdfium2>=4.30",
+    "pypdf>=4.0",
     "Pillow>=10.0",
     "pydantic>=2.7",
     "beartype>=0.18",

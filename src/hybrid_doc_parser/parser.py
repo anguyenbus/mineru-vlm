@@ -1229,15 +1229,12 @@ def _build_parser_output(
             page_count = 0
 
         # Get text-layer token counts for quality gate Layer 1.
-        # NOTE: pypdfium2 is not thread-safe; acquire the lock before any call
-        # that opens a PDF document to prevent segfaults in parse_batch().
         token_counts: dict[int, int] = {}
         is_non_pdf = file_path.suffix.lower() != ".pdf"
         if not is_non_pdf:
             from hybrid_doc_parser.render import text_layer_tokens  # noqa: PLC0415
 
-            with _PDFIUM_LOCK:
-                token_counts = text_layer_tokens(file_path)
+            token_counts = text_layer_tokens(file_path)
 
         # Non-PDF Layer 1 skip: log once at file level for observability.
         if is_non_pdf:

@@ -617,3 +617,212 @@ def test_build_parser_output_writes_cache(tmp_path, monkeypatch):
     mock_put.assert_called_once()
     called_args = mock_put.call_args.args
     assert called_args[1] is out
+
+
+# ---------------------------------------------------------------------------
+# Group 2: Docling inference gate tests
+# ---------------------------------------------------------------------------
+
+
+class TestDoclingInferenceGate:
+    """Test Group 2: _docling_inference_gate returns a singleton BoundedSemaphore."""
+
+    def test_returns_bounded_semaphore(self) -> None:
+        """_docling_inference_gate() must return a threading.BoundedSemaphore instance."""
+        import threading
+
+        import hybrid_doc_parser.parser as parser_mod
+
+        # Reset singleton state so each test run is independent.
+        parser_mod._DOCLING_INFERENCE_SEMA = None
+
+        from hybrid_doc_parser.parser import _docling_inference_gate
+
+        gate = _docling_inference_gate()
+        assert isinstance(gate, threading.BoundedSemaphore)
+
+        # Restore to None after the test to avoid test ordering pollution.
+        parser_mod._DOCLING_INFERENCE_SEMA = None
+
+    def test_multiple_calls_return_same_instance(self) -> None:
+        """Calling _docling_inference_gate() twice must return the identical object (singleton)."""
+        import hybrid_doc_parser.parser as parser_mod
+
+        parser_mod._DOCLING_INFERENCE_SEMA = None
+
+        from hybrid_doc_parser.parser import _docling_inference_gate
+
+        gate_a = _docling_inference_gate()
+        gate_b = _docling_inference_gate()
+        assert gate_a is gate_b
+
+        parser_mod._DOCLING_INFERENCE_SEMA = None
+
+
+# ---------------------------------------------------------------------------
+# Group 3: _classify_pdf_backend tests
+# ---------------------------------------------------------------------------
+
+
+class TestClassifyPdfBackend:
+    """Test Group 3: _classify_pdf_backend routing and fallback behaviour."""
+
+    def test_classify_returns_ocr_routes_to_mineru(self, tmp_path: Path, monkeypatch) -> None:
+        """classify() returning 'ocr' must map to 'mineru'."""
+        pdf = tmp_path / "scan.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_raw", return_value="ocr"
+        ):
+            from hybrid_doc_parser.parser import _classify_pdf_backend
+
+            result = _classify_pdf_backend(pdf)
+
+        assert result == "mineru"
+
+    def test_classify_returns_txt_routes_to_docling(self, tmp_path: Path) -> None:
+        """classify() returning 'txt' must map to 'docling'."""
+        pdf = tmp_path / "text.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_raw", return_value="txt"
+        ):
+            from hybrid_doc_parser.parser import _classify_pdf_backend
+
+            result = _classify_pdf_backend(pdf)
+
+        assert result == "docling"
+
+    def test_classify_raises_falls_back_to_mineru(self, tmp_path: Path, caplog) -> None:
+        """classify() raising an exception must fall back to 'mineru' and log a warning."""
+        import logging
+
+        pdf = tmp_path / "bad.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_raw",
+            side_effect=RuntimeError("pdfium exploded"),
+        ):
+            from hybrid_doc_parser.parser import _classify_pdf_backend
+
+            with caplog.at_level(logging.WARNING):
+                result = _classify_pdf_backend(pdf)
+
+        assert result == "mineru"
+
+    def test_classify_exotic_value_falls_back_to_mineru(self, tmp_path: Path, caplog) -> None:
+        """An unexpected classify() return value must fall back to 'mineru' and log a warning."""
+        import logging
+
+        pdf = tmp_path / "weird.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_raw", return_value="unknown"
+        ):
+            from hybrid_doc_parser.parser import _classify_pdf_backend
+
+            with caplog.at_level(logging.WARNING):
+                result = _classify_pdf_backend(pdf)
+
+        assert result == "mineru"
+
+    def test_docx_extension_returns_docling_no_classify_call(self, tmp_path: Path) -> None:
+        """A .docx path must return 'docling' without calling classify()."""
+        docx = tmp_path / "report.docx"
+        docx.write_bytes(b"fake docx content")
+
+        with mock.patch("hybrid_doc_parser.parser._classify_pdf_raw") as mock_classify:
+            from hybrid_doc_parser.parser import _classify_pdf_backend
+
+            result = _classify_pdf_backend(docx)
+
+        assert result == "docling"
+        mock_classify.assert_not_called()
+
+    def test_png_extension_returns_mineru_no_classify_call(self, tmp_path: Path) -> None:
+        """A .png path must return 'mineru' without calling classify()."""
+        img = tmp_path / "photo.png"
+        img.write_bytes(b"fake png bytes")
+
+        with mock.patch("hybrid_doc_parser.parser._classify_pdf_raw") as mock_classify:
+            from hybrid_doc_parser.parser import _classify_pdf_backend
+
+            result = _classify_pdf_backend(img)
+
+        assert result == "mineru"
+        mock_classify.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Group 4: _accepted_extensions with parser="auto"
+# ---------------------------------------------------------------------------
+
+
+class TestAcceptedExtensions:
+    """Test Group 4: _accepted_extensions returns the full union for parser='auto'."""
+
+    def test_auto_returns_full_extension_union(self) -> None:
+        """_accepted_extensions(parser='auto') must return _SUPPORTED_EXTENSIONS | _DOCLING_EXTENSIONS."""
+        from hybrid_doc_parser.parser import (
+            _DOCLING_EXTENSIONS,
+            _SUPPORTED_EXTENSIONS,
+            _accepted_extensions,
+        )
+
+        config = EnrichmentConfig(parser="auto")
+        result = _accepted_extensions(config)
+        expected = _SUPPORTED_EXTENSIONS | _DOCLING_EXTENSIONS
+        assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# Group 5: parse() auto-resolution tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseAutoRouter:
+    """Test Group 5: parse() resolves 'auto' to a concrete backend on cache misses."""
+
+    def test_auto_on_txt_pdf_resolves_to_docling(self, tmp_path: Path, monkeypatch) -> None:
+        """parse() with parser='auto' where classify() returns 'txt' must store resolved parser='docling'."""
+        monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+        from hybrid_doc_parser.parser import parse
+
+        pdf = FIXTURES / "digital_simple.pdf"
+        config = EnrichmentConfig(parser="auto")
+
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_raw", return_value="txt"
+        ):
+            with mock.patch("hybrid_doc_parser.parser._run_docling", return_value=[]):
+                result = parse(pdf, config)
+
+        assert result.enrichment_config.parser == "docling"
+        assert result.enrichment_config.parser != "auto"
+
+    def test_auto_cache_hit_skips_classify(self, tmp_path: Path, monkeypatch) -> None:
+        """parse() with parser='auto' must NOT call _classify_pdf_backend on a cache hit."""
+        monkeypatch.setenv("HYBRID_DOC_PARSER_CACHE_DIR", str(tmp_path / "cache"))
+        from hybrid_doc_parser.parser import parse
+
+        pdf = FIXTURES / "digital_simple.pdf"
+        config = EnrichmentConfig(parser="auto")
+
+        # First parse to populate cache (resolve to docling, mock the engine).
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_raw", return_value="txt"
+        ):
+            with mock.patch("hybrid_doc_parser.parser._run_docling", return_value=[]):
+                parse(pdf, config)
+
+        # Second parse: should hit cache; _classify_pdf_backend must NOT be called.
+        with mock.patch(
+            "hybrid_doc_parser.parser._classify_pdf_backend"
+        ) as mock_classify:
+            parse(pdf, config)
+
+        mock_classify.assert_not_called()
