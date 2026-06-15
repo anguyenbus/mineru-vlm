@@ -169,7 +169,7 @@ flowchart LR
 
     subgraph Backend
         M["MinerU\n(GPU inference)"]
-        DL["Docling\n(CPU only)"]
+        DL["Docling\n()"]
     end
 
     A --> OCR --> M

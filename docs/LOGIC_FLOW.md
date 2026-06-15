@@ -74,7 +74,7 @@ caller can also force a specific engine.
 flowchart TD
     DOC[📄 Document arrives] --> Q1{What kind of file?}
 
-    Q1 -- Word / HTML --> DOCLING[Docling engine<br/>fast · CPU only]
+    Q1 -- Word / HTML --> DOCLING[Docling engine<br/>fast · ]
     Q1 -- Image --> MINERU[MinerU engine<br/>vision-capable · GPU]
     Q1 -- PDF --> Q2{Clean digital text,<br/>or scanned / garbled?}
 
