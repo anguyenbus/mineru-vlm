@@ -12,7 +12,7 @@ For a workload that needs **text + tables + forms parsed into structured Markdow
 
 - **Textract is the weakest fit** for this specific requirement. To extract text + tables + forms it lands on the most expensive per-page tier (~$0.065/page ≈ **$16.4k/year**), and it still does **not** emit Markdown or LaTeX — you would build a JSON→Markdown layer yourself and accept weaker table/reading-order fidelity.
 - **Bedrock Sonnet** delivers full Markdown parsing at **~$0.018/page (~$4.5k/year)**, halving to **~$0.009/page (~$2.3k/year)** with Batch inference. Zero GPU ops. Strong all-rounder.
-- **MinerU VLM** has the best parsing accuracy on public benchmarks and the lowest *compute* cost at this volume (the entire month is ~3 GPU-hours), but carries real engineering/ops overhead.
+- **MinerU VLM** has the best parsing accuracy on public benchmarks. On a 10h×5d GPU schedule its raw compute is only **~$96/mo (spot) or ~$218/mo (on-demand)** — actually the cheapest option at 21k pages — but it carries real, unpriced engineering/ops overhead, which is the true deciding factor.
 - **Docling** is the cheapest and easiest to run locally, but the lowest accuracy on complex tables and effectively no formula support — suitable only if documents are simple.
 
 **Suggested path:** if staying managed/low-ops → Bedrock Sonnet (test Batch mode). If output quality is paramount and a GPU/MLOps capability exists → MinerU. Run a side-by-side accuracy bake-off on a sample of *your* documents before committing.
@@ -38,10 +38,10 @@ For a workload that needs **text + tables + forms parsed into structured Markdow
 | **Bedrock Sonnet 4.6** — Batch (–50%) | ~$0.009 | ~$189 | ~$2,268 | 24-hour SLA; ideal for non-real-time batch parsing. |
 | **Bedrock Data Automation** — Standard Output | $0.010 | ~$210 | ~$2,520 | Managed IDP; flat per-page; verified on AWS pricing page. |
 | **Bedrock Data Automation** — Custom Output (≤30 fields) | $0.040 | ~$840 | ~$10,080 | Structured field extraction via Blueprints; +$0.0005/field above 30. |
-| **MinerU VLM** — self-hosted GPU | compute only (~3 GPU-hrs/mo) | ~$50–730 + ops | varies + ops | Compute is trivial at this volume; cost is the GPU instance posture + engineering/ops. |
-| **Docling** — self-hosted (CPU/GPU) | compute only (light) | ~$30–300 + ops | varies + ops | Runs on CPU; cheapest compute, but lowest accuracy. |
+| **MinerU VLM** — self-hosted GPU (10h×5d) | compute only (~6–19 hrs needed) | ~$96–218 + ops | ~$1,149–2,616 + ops | g5.xlarge run 10h/day × 5d/wk ≈ 217 hrs/mo: $96 spot / $218 on-demand. Cost is instance posture + ops, not inference. |
+| **Docling** — self-hosted (CPU/GPU, 10h×5d) | compute only (light) | ~$96–218 + ops | ~$1,149–2,616 + ops | Same schedule/instance; runs even on CPU; cheapest compute, but lowest accuracy. |
 
-**Self-hosting cost note:** MinerU2.5 parses ~2.12 pages/sec on an A100, so 21,000 pages ≈ 2.7 hours of compute/month. If you keep a warm endpoint (e.g. an A10G-class `g5.xlarge` ~$1/hr on-demand, ~$0.30/hr spot) the dominant cost is idle instance time and operational effort, not the inference itself. Below ~hundreds of thousands of pages/month, the open-source cost advantage is mostly about avoiding per-page API fees at scale — at 21k/month the managed options are already cheap, so the self-hosting case rests on accuracy and data-residency, not raw cost.
+**Self-hosting cost note (verified):** MinerU2.5 parses ~2.12 pages/sec on an A100 (figure from the MinerU2.5 paper; an A10G will be slower). Run on the assumed schedule of **10 hrs/day × 5 days/week ≈ 217 instance-hours/month**, an A10G-class `g5.xlarge` costs **$1.006/hr → $217.97/mo on-demand**, or **$0.4419/hr spot → $95.75/mo**. That schedule has ample headroom: 21,000 pages needs only ~6–19 hours of actual compute (at 0.3–1.0 pages/sec), so a single instance on this schedule could handle **~390,000 pages/month** before you'd need more hours or a second box. At 21k pages the raw compute is therefore cheap — **$96–218/mo** — but **engineering/ops time remains the real, unpriced cost**, and spot adds interruption risk (manageable for batch with checkpointing).
 
 ---
 
@@ -97,6 +97,80 @@ OmniDocBench is the standard public benchmark for full-document parsing (text ed
 
 ---
 
+## Cost-optimal option by monthly volume
+
+The economics split into two cost shapes: **per-page managed APIs** are purely variable (zero fixed cost, cost scales linearly), while **self-hosted GPU** is a near-fixed monthly cost. On the assumed schedule (10h/day × 5d/wk ≈ 217 hrs/mo), one g5.xlarge costs a flat **~$96/mo (spot) or ~$218/mo (on-demand)** and can serve up to ~390,000 pages/month before needing more hours. Variable options win at low volume; the fixed-cost self-host wins once volume amortizes the instance.
+
+**Break-even volumes (raw cost, verified math; self-host on the 10h×5d schedule):**
+- Self-host (spot, ~$96/mo) beats the cheapest managed option (Sonnet Batch, $0.009/pg) at **~10,600 pages/month**.
+- Self-host (on-demand, ~$218/mo) beats Sonnet Batch at **~24,200 pages/month**.
+- Self-host (spot) beats Textract Forms+Tables ($0.065/pg) at just **~1,500 pages/month** — because Textract is the most expensive per-page option.
+- **Your 21,000-page workload sits right around these crossovers:** self-host spot (~$96) is already cheaper than every managed option, and self-host on-demand (~$218) is roughly level with Sonnet Batch ($189) and BDA ($210).
+
+**Recommended option by volume** (assumes the text+tables+forms→Markdown workload; "ops" = engineering/maintenance, unpriced but real):
+
+| Monthly volume | Cheapest on raw $/page | Practical recommendation | Why |
+|---|---|---|---|
+| **< 10,000** | Sonnet Batch / BDA | **Managed** — Sonnet Batch or BDA Standard | Below self-host break-even; variable cost trivial; ops never justified |
+| **10,000 – 25,000** *(your 21k sits here)* | Self-host spot (~$96) edges ahead | **Managed if low-ops; self-host spot if you already run GPUs** | Raw saving vs Sonnet Batch is small (~$90/mo) and easily offset by ops + spot-interruption handling |
+| **25,000 – 80,000** | Self-host (spot, then on-demand past ~24k) | **Self-host GPU, or hybrid** | Self-host now clearly cheaper; ops increasingly justified by the saving |
+| **80,000 – 390,000** | Self-host (scheduled instance) | **Self-host GPU** (MinerU/Docling) | Decisive cost win; one scheduled instance still has capacity |
+| **> 390,000** | Self-host (extend hours / add instances) | **Self-host GPU + hybrid burst** | Exceeds single-instance scheduled capacity; extend toward 24/7 or add boxes; route spikes to a managed API |
+
+**Where each named option is actually optimal:**
+- **Textract** — essentially *never* the cheapest for this text+tables+forms workload (most expensive per-page at $0.065). Justified only when its specific forms/key-value extraction quality is a hard requirement, and then only at low volume.
+- **Bedrock Sonnet Batch / BDA Standard** — the low-to-mid volume sweet spot (roughly < 35k/mo), and the right choice for your 21k workload.
+- **Self-host GPU (MinerU / Docling)** — on the 10h×5d schedule, becomes the raw-cost winner above ~10,600 pages/mo (spot) or ~24,200/mo (on-demand). Practically, the high-volume choice (> ~25k/mo) where the saving clearly outweighs GPU ops.
+- **Hybrid (self-host baseline + API burst)** — optimal when you have a *high, steady baseline* plus *variable spikes*: size the GPU to the baseline (cheap fixed cost, near-zero marginal) and overflow peaks to Sonnet/BDA. Typically meaningful above ~50k/mo with bursty load, or near single-instance capacity (~390k/mo).
+
+**Monthly cost at sample volumes** (managed = no ops; self-host = scheduled instance 10h×5d, ops excluded):
+
+| Pages/mo | Sonnet Batch | BDA Std | Sonnet on-demand | Textract F+T | Self-host spot (10h×5d) | Self-host on-demand (10h×5d) |
+|---|---|---|---|---|---|---|
+| 5,000 | **$45** | $50 | $90 | $325 | $96 | $218 |
+| **21,000** | $189 | $210 | $378 | $1,365 | **$96** | $218 |
+| 35,000 | $315 | $350 | $630 | $2,275 | **$96** | $218 |
+| 50,000 | $450 | $500 | $900 | $3,250 | **$96** | $218 |
+| 100,000 | $900 | $1,000 | $1,800 | $6,500 | **$96** | $218 |
+| 250,000 | $2,250 | $2,500 | $4,500 | $16,250 | **$96** | $218 |
+| 500,000 † | $4,500 | $5,000 | $9,000 | $32,500 | **~$192–323 †** | ~$436–734 † |
+
+*Bold = cheapest in that row. Self-host figures use the 10h×5d schedule (~217 hrs/mo) and exclude engineering/ops, which pushes the practical break-even above the raw ~10.6k/mo crossover. † 500k exceeds a single scheduled instance's capacity (~390k/mo at ~0.5 pg/s) — you'd extend toward 24/7 (spot ~$323 / on-demand ~$734) or add a second instance.*
+
+---
+
+## Cost Verification (worked calculations)
+
+Every figure below = **verified per-unit rate × 21,000 pages/month**. Rates are sourced in the next section; arithmetic was recomputed and checked.
+
+**Textract** (rate × 21,000):
+- OCR only: $0.0015 × 21,000 = **$31.50/mo** → $378/yr
+- Tables only: $0.015 × 21,000 = **$315.00/mo** → $3,780/yr
+- Forms only: $0.05 × 21,000 = **$1,050.00/mo** → $12,600/yr
+- **Forms + Tables: ($0.015 + $0.05) × 21,000 = $0.065 × 21,000 = $1,365.00/mo → $16,380/yr**
+- Analyze Expense: $0.01 × 21,000 = **$210.00/mo** → $2,520/yr
+
+**Bedrock Sonnet 4.6** (rates: $3.00/M input, $15.00/M output):
+- Per-page @ user assumption (2,000 in + 800 out) = (2,000 × $3 + 800 × $15) / 1,000,000 = $0.006 + $0.012 = **$0.018/page**
+- Per-page @ AWS doc estimate (2,900 in + 750 out) = (2,900 × $3 + 750 × $15) / 1,000,000 = $0.0087 + $0.01125 = **$0.01995/page**
+- On-demand monthly: $0.018 × 21,000 = **$378.00/mo** → $4,536/yr  *(at AWS estimate: $0.01995 × 21,000 = $418.95/mo → $5,027/yr)*
+- Batch (–50%): $0.009 × 21,000 = **$189.00/mo** → $2,268/yr  *(at AWS estimate: $0.009975 × 21,000 = $209.47/mo → $2,514/yr)*
+
+**Bedrock Data Automation:**
+- Standard Output: $0.010 × 21,000 = **$210.00/mo** → $2,520/yr
+- Custom Output (≤30 fields): $0.040 × 21,000 = **$840.00/mo** → $10,080/yr
+
+**Self-hosted GPU (g5.xlarge, A10G, us-east-1) — schedule: 10h/day × 5d/wk ≈ 216.7 hrs/mo:**
+- Compute needed for 21k pages: 21,000 ÷ ~0.5 pages/sec ÷ 3,600 ≈ **11.7 hours/month** (≈5.8h at 1 pg/s, ≈19.4h at 0.3 pg/s) — comfortably within the 216.7 scheduled hours.
+- On-demand: $1.006/hr × 216.7 hrs = **$217.97/mo** → $2,615.60/yr
+- Spot: $0.4419/hr × 216.7 hrs = **$95.75/mo** → $1,148.94/yr
+- Single-instance capacity on this schedule ≈ 216.7 × 3,600 × 0.5 ≈ **390,000 pages/mo**.
+- *(Plus unpriced engineering/ops. The 2.12 pg/s headline is A100-measured; A10G is slower, hence the 0.3–1.0 pg/s working range above.)*
+
+**Cost ranking at this volume (cheapest → most expensive):** Self-host spot 10h×5d ($96) < Bedrock Sonnet Batch ($189) < BDA Standard ($210) ≈ Self-host on-demand 10h×5d ($218) < Textract Tables-only ($315) < Bedrock Sonnet on-demand ($378–419) < BDA Custom ($840) < **Textract Forms+Tables ($1,365)**. Self-host figures exclude engineering/ops, which is the deciding factor at this volume given the small raw gap.
+
+---
+
 ## Sources & Verification
 
 Verification key: **✅ Verified (primary)** = fetched directly from the official source on 15 Jun 2026 · **◑ Primary literature** = figure from the model's own paper or official model card · **○ Third-party** = single-vendor benchmark, not independently verified.
@@ -117,10 +191,12 @@ Verification key: **✅ Verified (primary)** = fetched directly from the officia
 | Bedrock per-page token estimate | ~2,900 in / ~750 out per page | AWS Bedrock pricing page, "Data Automation – Pricing Example 3" | ✅ |
 | Bedrock Data Automation Standard Output | $0.010/page | AWS Bedrock pricing page, "Data Automation – Pricing Example 3" | ✅ |
 | Bedrock Data Automation Custom Output | $0.040/page (≤30 fields) | AWS Bedrock pricing page, "Data Automation – Pricing Example 1" | ✅ |
+| EC2 g5.xlarge (A10G GPU) | $1.006/hr on-demand; $0.4419/hr spot → at 10h×5d (~217h): $218/mo OD, $96/mo spot | AWS EC2 on-demand pricing; cross-checked Vantage/DoiT (us-east-1) | ✅ |
 
 **Primary source URLs:**
 - AWS Textract pricing: https://aws.amazon.com/textract/pricing/ (page last updated 2026-05-13)
 - AWS Bedrock pricing: https://aws.amazon.com/bedrock/pricing/ (page last updated 2026-06-02)
+- AWS EC2 on-demand pricing: https://aws.amazon.com/ec2/pricing/on-demand/ · g5.xlarge spec/spot: https://instances.vantage.sh/aws/ec2/g5.xlarge
 
 ### Benchmark / accuracy figures
 
