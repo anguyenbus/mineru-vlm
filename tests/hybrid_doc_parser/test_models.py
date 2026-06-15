@@ -271,3 +271,160 @@ class TestEnrichmentConfigAutoParser:
         """
         with pytest.raises(ValidationError):
             EnrichmentConfig(parser="invalid_value")
+
+
+# ---------------------------------------------------------------------------
+# Task Group 1: Verifier schema layer (VerifierConfig / VerificationReport)
+# ---------------------------------------------------------------------------
+
+from hybrid_doc_parser.models import (  # noqa: E402
+    Disagreement,
+    ExtraElement,
+    MissingElement,
+    PageVerification,
+    Severity,
+    VerificationReport,
+    VerifierConfig,
+)
+
+
+class TestVerifierConfigDefaults:
+    """VerifierConfig constructs with zero args and is safe (verifier off)."""
+
+    def test_zero_arg_defaults_are_safe(self) -> None:
+        """VerifierConfig() must default to a disabled, precision-favoring config."""
+        cfg = VerifierConfig()
+        assert cfg.enabled is False
+        assert cfg.force_verify_all is False
+        assert cfg.min_severity_to_report == "high"
+        assert cfg.max_concurrency >= 1
+        assert cfg.max_pages_per_doc >= 1
+        assert cfg.timeout > 0
+
+
+class TestVerifierConfigBounds:
+    """Field(...) bounds reject out-of-range values."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_concurrency": 0},  # ge=1
+            {"max_pages_per_doc": 0},  # ge=1
+            {"timeout": 0},  # gt=0
+            {"render_dpi": 71},  # below lower bound
+            {"render_dpi": 601},  # above upper bound
+        ],
+    )
+    def test_out_of_range_raises(self, kwargs: dict) -> None:
+        """Each out-of-range field value must raise ValidationError."""
+        with pytest.raises(ValidationError):
+            VerifierConfig(**kwargs)
+
+
+class TestVerifierModelsFrozen:
+    """All verifier models are frozen — mutation raises."""
+
+    def test_config_is_frozen(self) -> None:
+        """Mutating VerifierConfig must raise."""
+        cfg = VerifierConfig()
+        with pytest.raises((TypeError, ValidationError)):
+            cfg.enabled = True  # type: ignore[misc]
+
+    def test_report_is_frozen(self) -> None:
+        """Mutating VerificationReport must raise."""
+        report = VerificationReport(model_id="m", prompt_version="v1")
+        with pytest.raises((TypeError, ValidationError)):
+            report.model_id = "other"  # type: ignore[misc]
+
+
+class TestVerificationReportEnvelope:
+    """A populated VerificationReport serializes to the canonical envelope shape."""
+
+    def _make_report(self) -> VerificationReport:
+        return VerificationReport(
+            model_id="anthropic.claude-...",
+            prompt_version="v1",
+            pages=[
+                PageVerification(
+                    page_idx=3,
+                    disagreements=[
+                        Disagreement(
+                            element_id="p3-e7",
+                            type=ElementType.table,
+                            severity=Severity.high,
+                            reason="Row 4 merged two columns; values misaligned vs image.",
+                            suggested_text="...",
+                            vlm_confidence=0.86,
+                        )
+                    ],
+                    missing_elements=[
+                        MissingElement(
+                            severity=Severity.medium,
+                            reason="Footnote at page bottom not extracted.",
+                            approx_location="below last paragraph",
+                        )
+                    ],
+                    extra_elements=[
+                        ExtraElement(
+                            severity=Severity.low,
+                            reason="Spurious header repeated.",
+                            approx_location="top of page",
+                        )
+                    ],
+                )
+            ],
+            warnings=[
+                WarningRecord(
+                    code="verification_failed",
+                    page_idx=9,
+                    message="Bedrock throttled after 3 retries",
+                )
+            ],
+        )
+
+    def test_serializes_under_top_level_verification_key(self) -> None:
+        """Top-level output must nest everything under the 'verification' key."""
+        dumped = self._make_report().model_dump()
+        assert set(dumped.keys()) == {"verification"}
+        inner = dumped["verification"]
+        assert set(inner.keys()) == {"model_id", "prompt_version", "pages", "warnings"}
+        assert inner["model_id"] == "anthropic.claude-..."
+        assert inner["prompt_version"] == "v1"
+
+    def test_envelope_matches_canonical_shape(self) -> None:
+        """The serialized payload must match the canonical disagreement/missing/extra shape."""
+        inner = self._make_report().model_dump()["verification"]
+
+        page = inner["pages"][0]
+        assert page["page_idx"] == 3
+
+        dis = page["disagreements"][0]
+        assert dis["element_id"] == "p3-e7"
+        assert dis["type"] == "table"
+        assert dis["severity"] == "high"
+        assert dis["vlm_confidence"] == 0.86
+        assert set(dis.keys()) == {
+            "element_id",
+            "type",
+            "severity",
+            "reason",
+            "suggested_text",
+            "vlm_confidence",
+        }
+
+        miss = page["missing_elements"][0]
+        assert "element_id" not in miss
+        assert set(miss.keys()) == {"severity", "reason", "approx_location"}
+
+        extra = page["extra_elements"][0]
+        assert "element_id" not in extra
+        assert set(extra.keys()) == {"severity", "reason", "approx_location"}
+
+        warn = inner["warnings"][0]
+        assert warn["code"] == "verification_failed"
+        assert warn["page_idx"] == 9
+
+    def test_json_dump_wraps_in_verification(self) -> None:
+        """model_dump_json() must also produce the top-level 'verification' envelope."""
+        json_str = self._make_report().model_dump_json()
+        assert json_str.lstrip().startswith('{"verification":')

@@ -82,6 +82,9 @@ uv pip install -e ".[docling]"
 
 # with dev tooling (tests, lint, fixture generators)
 uv pip install -e ".[dev]"
+
+# with the standalone advisory verifier (boto3 + openai; see docs/verifier.md)
+uv pip install -e ".[verifier]"
 ```
 
 > **GPU note:** MinerU and the VLM backend run best on a GPU. To force CPU on an
@@ -138,7 +141,9 @@ The package exports a small, stable surface (`hybrid_doc_parser.__init__`):
 | `parse(file_path, config=None)` | function | Parse one document → `ParserOutput`. Never raises. |
 | `parse_batch(paths, config=None, max_concurrency=4)` | async function | Parse many documents, in input order, with chunked MinerU batch inference. |
 | `render_markdown(output)` | function | Render a `ParserOutput` to RAG-ready Markdown. |
+| `verify(parser_output, file_path, config)` | function | **(Experimental)** Advisory second-opinion verifier run AFTER `parse()`. Never raises. See [docs/verifier.md](docs/verifier.md). |
 | `EnrichmentConfig` | model | Backend + enrichment configuration. |
+| `VerifierConfig`, `VerificationReport` | models | **(Experimental)** Verifier config + advisory report (top-level `verification` envelope). See [docs/verifier.md](docs/verifier.md). |
 | `ParserOutput` | model | Full structured result. |
 | `ElementRecord`, `PageRecord`, `WarningRecord`, `ElementType` | models | Components of the output schema. |
 
@@ -193,6 +198,45 @@ it. The rationale (cost, privacy, control) is documented in
 
 ---
 
+## Advisory verifier (experimental)
+
+> **STATUS: DESIGN / EXPERIMENTAL — NOT YET RECOMMENDED FOR PRODUCTION USE.**
+> The design and implementation are complete, but the feature is not recommended
+> for production until a real-model precision/recall measurement passes the eval
+> gate. The current gate artifact validates only the eval *harness* against a
+> deterministic fake backend, not a real model.
+
+`verify(parser_output, file_path, config)` is a **standalone, advisory
+second-opinion** step the caller runs **AFTER** `parse()`. It renders the source
+page image and asks a VLM to flag high-confidence disagreements (plus missing and
+extra elements) against MinerU's extraction, returning a `VerificationReport`.
+
+It is deliberately separate from `parse()`: it is never called from inside
+`parse()`/`parse_batch()`, never mutates the parse output, has its own optional
+`verifier` extra (lazy `boto3`/`openai` imports) and its own verification cache —
+so `parse()`'s local / deterministic / never-network / never-raises / cacheable
+invariants are fully preserved. PDF and image inputs only; DOCX/HTML no-op with a
+`verification_unsupported` warning.
+
+```python
+from pathlib import Path
+from hybrid_doc_parser import parse, verify, VerifierConfig
+
+output = parse(Path("scan.pdf"))                       # local, deterministic, cacheable
+report = verify(                                       # edge-only second opinion
+    output, Path("scan.pdf"),
+    VerifierConfig(enabled=True, backend="bedrock",
+                   model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+                   region="ap-southeast-2"),
+)
+```
+
+Full contract, `VerifierConfig` fields, the `verification` report envelope, the
+optional extra, the separate cache, limitations, known issues, and the eval gate
+are documented in **[docs/verifier.md](docs/verifier.md)**.
+
+---
+
 ## Output schema
 
 ```
@@ -224,9 +268,11 @@ round-trips as base64. Full field-by-field reference and warning-code table:
 | `src/hybrid_doc_parser/render.py` | PDF rasterisation + text-layer token counting (pypdfium2). |
 | `src/hybrid_doc_parser/cache.py` | File-keyed `ParserOutput` cache (atomic writes). |
 | `src/hybrid_doc_parser/markdown.py` | `render_markdown` — RAG-ready Markdown rendering. |
+| `src/hybrid_doc_parser/verifier.py` | **(Experimental)** Standalone advisory `verify()` + `VerifierClient` backends. |
+| `src/hybrid_doc_parser/verifier_cache.py` | **(Experimental)** Separate file-based verification cache. |
 | `scripts/` | Benchmarking (`bench_docbench.py`), prediction generation, real-batch smoke test. |
 | `tests/` | Unit + integration tests. |
-| `docs/` | Architecture, pipeline, packages, benchmarks, self-hosting. |
+| `docs/` | Architecture, pipeline, packages, benchmarks, self-hosting, verifier. |
 
 ---
 

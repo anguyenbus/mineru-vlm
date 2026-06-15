@@ -7,18 +7,24 @@ from hybrid_doc_parser.models import (
     EnrichmentConfig,
     PageRecord,
     ParserOutput,
+    VerificationReport,
+    VerifierConfig,
     WarningRecord,
 )
 from hybrid_doc_parser.parser import parse, parse_batch
+from hybrid_doc_parser.verifier import verify
 
 __all__ = [
     "parse",
     "parse_batch",
     "render_markdown",
+    "verify",
     "ParserOutput",
     "ElementRecord",
     "ElementType",
     "PageRecord",
     "EnrichmentConfig",
+    "VerifierConfig",
+    "VerificationReport",
     "WarningRecord",
 ]

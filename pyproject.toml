@@ -31,6 +31,14 @@ dev = [
 docling = [
     "docling>=2.0",
 ]
+# Optional cloud SDKs for the standalone advisory verifier (verify()). These are
+# imported LAZILY inside the verifier client methods (hybrid_doc_parser.verifier)
+# so the core library stays cloud-SDK-free for non-verifying users; install this
+# extra only when running Bedrock / OpenAI-compatible verification.
+verifier = [
+    "boto3>=1.34",
+    "openai>=1.30",
+]
 
 [build-system]
 requires = ["hatchling"]

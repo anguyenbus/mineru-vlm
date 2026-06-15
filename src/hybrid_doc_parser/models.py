@@ -14,9 +14,9 @@ Typical usage:
 from __future__ import annotations
 
 from enum import Enum
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -49,6 +49,20 @@ class ElementType(str, Enum):
     footer = "footer"
     page_number = "page_number"
     unknown = "unknown"
+
+
+class Severity(str, Enum):
+    """Severity of a verifier finding (disagreement / missing / extra element).
+
+    Inherits from ``str`` so members compare equal to their string values,
+    e.g. ``Severity.high == "high"`` is ``True``. Used by the standalone
+    ``verify()`` advisory verifier to rank findings and to filter them via
+    ``VerifierConfig.min_severity_to_report`` (precision-favoring).
+    """
+
+    low = "low"
+    medium = "medium"
+    high = "high"
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +121,58 @@ class EnrichmentConfig(BaseModel):
     table_mode: Literal["fast", "accurate"] = "fast"
     do_table_structure: bool = True
     docling_artifacts_path: str | None = None
+
+
+class VerifierConfig(BaseModel):
+    """Configuration for the standalone, advisory ``verify()`` second-opinion verifier.
+
+    This model is deliberately SEPARATE from :class:`EnrichmentConfig`: the
+    verifier is a distinct, edge-only capability (all VLM/network activity lives
+    at the caller's edge, never inside ``parse()``). All fields have safe
+    defaults so callers can construct with zero arguments and get a verifier
+    that is OFF (``enabled=False``).
+
+    Defaults are tuned to favor PRECISION over recall: ``min_severity_to_report``
+    defaults to ``"high"`` so only high-confidence findings surface, and
+    ``force_verify_all`` defaults to ``False`` so only quality-gate-flagged pages
+    are verified.
+
+    Attributes:
+        enabled: Master switch; when ``False`` ``verify()`` performs no work.
+        backend: Which verifier backend to dispatch; ``"bedrock"`` (v1
+            primary), ``"openai_compatible"`` (local vllm/Ollama eval), or
+            ``"fake"`` (CI / no-network canned verdicts).
+        model: Bare on-demand model identifier (no inference-profile prefix).
+        region: Cloud region for the backend (e.g. AWS region for Bedrock).
+        force_verify_all: When ``True`` verify EVERY page, not just pages flagged
+            ``quality_decision == "promote_to_vlm"``. Eval/calibration only —
+            exists solely to measure the recall gap left by the quality gate.
+        max_concurrency: Upper bound on in-flight verifier calls; a SEPARATE
+            semaphore from ``parse_batch`` concurrency (Bedrock quotas are
+            independent of local engine concurrency). Must be ``>= 1``.
+        render_dpi: DPI for the full-page render fed to the verifier; the
+            existing megapixel clamp in ``render_page`` guards huge pages.
+            Bounded to a sane raster range (72–600).
+        max_pages_per_doc: HARD per-document cap on verified pages; truncation
+            is logged so a partially-verified document is never mistaken for
+            "all clean". Must be ``>= 1``.
+        timeout: Per-call timeout in seconds for the backend; must be ``> 0``.
+        min_severity_to_report: Drop findings below this severity from the
+            report; precision-favoring default of ``"high"``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    backend: Literal["bedrock", "openai_compatible", "fake"] = "bedrock"
+    model: str = ""
+    region: str = ""
+    force_verify_all: bool = False
+    max_concurrency: int = Field(default=2, ge=1)
+    render_dpi: int = Field(default=150, ge=72, le=600)
+    max_pages_per_doc: int = Field(default=50, ge=1)
+    timeout: float = Field(default=60.0, gt=0)
+    min_severity_to_report: Literal["low", "medium", "high"] = "high"
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +248,14 @@ class WarningRecord(BaseModel):
             ``"mineru_failed"``, ``"docling_failed"``, ``"vlm_failed"``,
             ``"quality_gate_error"``, ``"cache_write_error"``,
             ``"render_failed"``, ``"enrichment_not_supported"``,
-            ``"image_too_large"``, ``"docling_error"``, ``"mineru_error"``.
+            ``"image_too_large"``, ``"docling_error"``, ``"mineru_error"``,
+            ``"verification_failed"`` (a per-page/run verifier failure;
+            emitted by ``verify()`` when a page or the whole run fails),
+            ``"verification_unsupported"`` (the verifier no-ops a DOCX/HTML
+            input because no source image exists to compare against), and
+            ``"verification_truncated"`` (the ``max_pages_per_doc`` cap was hit
+            and some flagged pages were skipped — never mistake for "all
+            clean").
         message: Human-readable description of the problem.
     """
 
@@ -191,6 +264,146 @@ class WarningRecord(BaseModel):
     page_idx: int | None = None
     code: str
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Verifier report models (standalone ``verify()`` advisory output)
+# ---------------------------------------------------------------------------
+
+
+class Disagreement(BaseModel):
+    """A verifier disagreement keyed to an existing MinerU element.
+
+    Expresses that the verifier believes MinerU extracted an element
+    incorrectly. Advisory only: it NEVER mutates ``ElementRecord.text`` and
+    NEVER sets ``is_enriched``.
+
+    Attributes:
+        element_id: The ``ElementRecord.element_id`` this disagreement refers to.
+        type: The element's semantic type (mirrors ``ElementRecord.type``).
+        severity: Confidence-weighted severity of the disagreement.
+        reason: Human-readable explanation of why the verifier disagrees.
+        suggested_text: The verifier's proposed corrected text (advisory).
+        vlm_confidence: The verifier's self-reported confidence, ``0.0``–``1.0``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    element_id: str
+    type: ElementType
+    severity: Severity
+    reason: str
+    suggested_text: str
+    vlm_confidence: float = Field(ge=0.0, le=1.0)
+
+
+class MissingElement(BaseModel):
+    """A verifier-detected MinerU false NEGATIVE (an element MinerU dropped).
+
+    Has no ``element_id`` because the element does not exist in MinerU's output.
+
+    Attributes:
+        severity: Severity of the omission.
+        reason: Human-readable explanation of what was missed.
+        approx_location: Free-text approximate location on the page (no bbox).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    severity: Severity
+    reason: str
+    approx_location: str
+
+
+class ExtraElement(BaseModel):
+    """A verifier-detected MinerU false POSITIVE (an element MinerU invented).
+
+    Shares the shape of :class:`MissingElement` and likewise has no
+    ``element_id`` (the spurious element is described, not referenced).
+
+    Attributes:
+        severity: Severity of the spurious extraction.
+        reason: Human-readable explanation of why it is considered spurious.
+        approx_location: Free-text approximate location on the page (no bbox).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    severity: Severity
+    reason: str
+    approx_location: str
+
+
+class PageVerification(BaseModel):
+    """Per-page verifier verdict: disagreements plus missing/extra channels.
+
+    Attributes:
+        page_idx: Zero-indexed page number this verdict covers.
+        disagreements: Findings keyed to existing MinerU elements.
+        missing_elements: MinerU false negatives (no ``element_id``).
+        extra_elements: MinerU false positives (no ``element_id``).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    page_idx: int
+    disagreements: list[Disagreement] = Field(default_factory=list)
+    missing_elements: list[MissingElement] = Field(default_factory=list)
+    extra_elements: list[ExtraElement] = Field(default_factory=list)
+
+
+class VerificationReport(BaseModel):
+    """Top-level advisory output of a single ``verify()`` call.
+
+    This report is a SEPARATE return value: it is NOT a field on
+    ``ParserOutput`` and is NOT stored in the parse cache. It is advisory only
+    and never mutates the parse output.
+
+    Serialization nests the entire payload under a top-level ``verification``
+    key to match the canonical report envelope verbatim (see ``spec.md``).
+    ``model_dump()`` / ``model_dump_json()`` therefore both emit::
+
+        {"verification": {"model_id": ..., "prompt_version": ..., "pages": [...],
+                          "warnings": [...]}}
+
+    Attributes:
+        model_id: The verifier model identifier used for the run.
+        prompt_version: The stable prompt-version string used for the run.
+        pages: Per-page verdicts; empty when nothing was verified.
+        warnings: Non-fatal diagnostics (reuses :class:`WarningRecord`),
+            including ``verification_failed`` / ``verification_unsupported`` /
+            ``verification_truncated`` codes.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    model_id: str
+    prompt_version: str
+    pages: list[PageVerification] = Field(default_factory=list)
+    warnings: list[WarningRecord] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_verification_envelope(cls, data: Any) -> Any:
+        """Accept either the bare payload or the wrapped ``verification`` envelope.
+
+        Serialization always emits ``{"verification": {...}}``; this validator
+        makes deserialization symmetric by unwrapping that single-key envelope
+        on input, while still accepting a bare payload dict.
+        """
+        if isinstance(data, dict) and set(data.keys()) == {"verification"}:
+            return data["verification"]
+        return data
+
+    @model_serializer(mode="wrap")
+    def _wrap_in_verification_envelope(self, handler: Any) -> dict[str, Any]:
+        """Nest the serialized payload under the top-level ``verification`` key.
+
+        ``mode="wrap"`` calls the default serializer (``handler``) to produce
+        the inner dict, then wraps it so the output matches the canonical
+        ``{"verification": {...}}`` envelope verbatim.
+        """
+        return {"verification": handler(self)}
 
 
 # ---------------------------------------------------------------------------
