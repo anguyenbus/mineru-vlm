@@ -11,11 +11,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 from hybrid_doc_parser import parse
 from hybrid_doc_parser.models import EnrichmentConfig
+
+# Unlimited-OCR runs in its OWN venv (transformers 4.57.1, separate from the
+# project env). We shell out to it for inference, then build the ParserOutput in
+# this (project) process. Override the interpreter with UOCR_PYTHON if needed.
+_UOCR_PYTHON = os.environ.get("UOCR_PYTHON", "/workspace/uocr-venv/bin/python")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,10 +43,27 @@ def main(argv: list[str] | None = None) -> int:
         help="if set, also parse with MinerU2.5-Pro (vLLM) and write here",
     )
     ap.add_argument(
+        "--unlimited-out",
+        default=None,
+        help="if set, also parse with Unlimited-OCR (separate venv) and write here",
+    )
+    ap.add_argument(
         "--only",
-        choices=["mineru", "docling", "paddleocr", "mineru25pro"],
+        choices=["mineru", "docling", "paddleocr", "mineru25pro", "unlimited"],
         default=None,
         help="run a single backend only (avoids loading multiple GPU models at once)",
+    )
+    ap.add_argument("--dpi", type=int, default=300, help="rasterisation DPI for Unlimited-OCR")
+    ap.add_argument("--max-length", type=int, default=6144, help="Unlimited-OCR per-page token cap")
+    ap.add_argument("--base-size", type=int, default=1024, help="Unlimited-OCR global thumbnail size")
+    ap.add_argument(
+        "--image-size",
+        type=int,
+        default=640,
+        help=(
+            "Unlimited-OCR per-tile crop size. 640 is the trained single-image value; "
+            "768/1024 OOM/cuBLAS-fail on a 15GB GPU. Raise --dpi for small-text recall."
+        ),
     )
     args = ap.parse_args(argv)
 
@@ -61,6 +86,35 @@ def main(argv: list[str] | None = None) -> int:
             f"warnings={[w.code for w in out.warnings]})"
         )
 
+    def _run_unlimited(out_path: str) -> None:
+        # Inference in the Unlimited-OCR venv -> intermediate raw JSON; convert here.
+        # Keep the raw next to the output so converter fixes can re-run WITHOUT
+        # re-touching the GPU (re-convert via uocr_convert.build_parser_output).
+        print(f"[save_parser_json] parsing {src} with Unlimited-OCR ({_UOCR_PYTHON}) ...")
+        scripts_dir = Path(__file__).resolve().parent
+        raw_path = str(Path(out_path).with_suffix(".raw.json"))
+        subprocess.run(
+            [
+                _UOCR_PYTHON,
+                str(scripts_dir / "run_unlimited_ocr.py"),
+                "--pdf", str(src),
+                "--out", raw_path,
+                "--dpi", str(args.dpi),
+                "--max-length", str(args.max_length),
+                "--base-size", str(args.base_size),
+                "--image-size", str(args.image_size),
+            ],
+            check=True,
+        )
+        from uocr_convert import build_parser_output  # noqa: PLC0415
+
+        out = build_parser_output(json.loads(Path(raw_path).read_text()))
+        Path(out_path).write_text(out.model_dump_json())
+        print(
+            f"[save_parser_json]   -> {out_path} "
+            f"(pages={out.page_count}, elements={len(out.elements)})"
+        )
+
     want = args.only
 
     if want in (None, "mineru"):
@@ -75,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
             args.mineru25pro_out or "m25pro.json",
             EnrichmentConfig(parser="mineru25pro"),
         )
+    if (want == "unlimited") or (want is None and args.unlimited_out):
+        _run_unlimited(args.unlimited_out or "uocr.json")
     return 0
 
 

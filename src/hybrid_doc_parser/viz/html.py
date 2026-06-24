@@ -44,7 +44,7 @@ TYPE_COLORS = {
 DEFAULT_COLOR = "#9ca3af"
 
 # Tab order; only backends present in ``docs`` are emitted.
-_TAB_ORDER = ("mineru", "docling", "paddleocr", "mineru25pro", "pdfplumber")
+_TAB_ORDER = ("mineru", "docling", "paddleocr", "mineru25pro", "unlimited", "pdfplumber")
 
 # Human-facing tab button labels. The backend KEY (used for ``data-tab`` and the
 # panel id that the JS toggles) stays as the internal name; only the visible
@@ -52,6 +52,7 @@ _TAB_ORDER = ("mineru", "docling", "paddleocr", "mineru25pro", "pdfplumber")
 _TAB_LABELS = {
     "paddleocr": "paddleocr-vl-0.9B",
     "mineru25pro": "MinerU2.5-Pro-1.2B",
+    "unlimited": "Unlimited-OCR-3B",
 }
 
 

@@ -23,7 +23,7 @@ REPORT_OUT := $(REPORT_DIR)/$(REPORT_STEM).parse_report.html
 help:
 	@echo "Targets:"
 	@echo "  make parse file.pdf    - parse file.pdf (MinerU) -> <stem>.md, <stem>.json, <stem>.confidence.json"
-	@echo "  make report file.pdf   - parse file.pdf (MinerU + Docling + MinerU2.5-Pro) and build the linked HTML report"
+	@echo "  make report file.pdf   - parse file.pdf (MinerU + Docling + MinerU2.5-Pro + Unlimited-OCR) and build the linked HTML report"
 	@echo "  make viz-install       - install viz extra deps (pdfplumber, pillow, pypdfium2)"
 	@echo "  make test              - run the full test suite"
 	@echo "  make test-fast         - run tests excluding the 'slow' marker"
@@ -72,7 +72,8 @@ endif
 	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only mineru     --mineru-out "$(REPORT_DIR)/m.json"
 	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only docling    --docling-out "$(REPORT_DIR)/d.json"
 	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only mineru25pro --mineru25pro-out "$(REPORT_DIR)/m25pro.json"
-	$(PYTHON) scripts/parse_report.py "$(REPORT_SRC)" --mineru "$(REPORT_DIR)/m.json" --docling "$(REPORT_DIR)/d.json" --mineru25pro "$(REPORT_DIR)/m25pro.json" -o "$(REPORT_OUT)"
+	$(PYTHON) scripts/save_parser_json.py "$(REPORT_SRC)" --only unlimited  --unlimited-out "$(REPORT_DIR)/uocr.json"
+	$(PYTHON) scripts/parse_report.py "$(REPORT_SRC)" --mineru "$(REPORT_DIR)/m.json" --docling "$(REPORT_DIR)/d.json" --mineru25pro "$(REPORT_DIR)/m25pro.json" --unlimited "$(REPORT_DIR)/uocr.json" -o "$(REPORT_OUT)"
 	@echo "Open $(REPORT_OUT) in your browser (or VS Code) to review."
 
 report-clean:

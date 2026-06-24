@@ -80,6 +80,11 @@ COORD: Final[dict[str, dict[str, str]]] = {
     # scales it to per-mille (0..1000) at parse time (see _run_mineru25pro), so
     # the viewer treats it exactly like MinerU: ÷1000, no flip, no page size.
     "mineru25pro": {"origin": "topleft", "unit": "permille"},
+    # Unlimited-OCR (baidu/Unlimited-OCR) emits grounded boxes already normalised
+    # per-axis to 0..999, top-left (the model's <|det|> coordinate convention);
+    # the converter stores them as per-mille, so treat it like MinerU: ÷1000, no
+    # flip, no page size.
+    "unlimited": {"origin": "topleft", "unit": "permille"},
     # Docling prov bbox stored [l, b, r, t]: PDF points, bottom-left. ÷points,
     # flip Y.
     "docling": {"origin": "bottomleft", "unit": "points"},
